@@ -1,0 +1,836 @@
+#!/usr/bin/env python3
+"""
+Weekly U.S. Congress stock-trade disclosure monitor.
+
+Pulls Periodic Transaction Report (PTR) filings from the official
+House Clerk financial-disclosure dataset, filters to the most recent
+completed week, flags priority-trader activity, builds a Markdown
+report in the project's standard format, and delivers it to Telegram.
+
+Data source (no JS / no API key required):
+    https://disclosures-clerk.house.gov/public_disc/financial-pdfs/{YEAR}FD.zip
+    -> contains {YEAR}FD.xml : an index of every disclosure filing that year.
+
+Senate PTR detail (efdsearch.senate.gov) requires a CSRF-token session and
+is logged as a data gap rather than scraped, mirroring the report template.
+
+Usage:
+    python congress_trades.py                 # last completed week, send to Telegram
+    python congress_trades.py --no-send       # build report only, print to stdout
+    python congress_trades.py --week 2026-06-15   # force a specific Monday start
+"""
+
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import html
+import io
+import json
+import os
+import re
+import sys
+import time
+import urllib.parse
+import urllib.request
+import xml.etree.ElementTree as ET
+import zipfile
+from pathlib import Path
+
+try:
+    import pdfplumber  # for reading per-trade detail out of House PTR PDFs
+    HAS_PDF = True
+except ImportError:
+    HAS_PDF = False
+
+try:
+    from curl_cffi import requests as cffi_requests  # bypasses Akamai on Senate site
+    HAS_CURL = True
+except ImportError:
+    HAS_CURL = False
+
+# --------------------------------------------------------------------------- #
+# Config
+# --------------------------------------------------------------------------- #
+
+PROJECT_DIR = Path(__file__).resolve().parent
+REPORTS_DIR = PROJECT_DIR / "reports"
+CONFIG_FILE = PROJECT_DIR / "telegram_config.json"
+
+HOUSE_FD_ZIP = "https://disclosures-clerk.house.gov/public_disc/financial-pdfs/{year}FD.zip"
+HOUSE_PTR_PDF = "https://disclosures-clerk.house.gov/public_disc/ptr-pdfs/{year}/{doc}.pdf"
+
+# (first name, last name) - last name may be compound (e.g. "Wasserman Schultz").
+PRIORITY_TRADERS = [
+    ("Nancy", "Pelosi"), ("Dan", "Crenshaw"), ("Josh", "Gottheimer"),
+    ("Ro", "Khanna"), ("Tommy", "Tuberville"), ("Mark", "Green"),
+    ("Debbie", "Wasserman Schultz"), ("Sheldon", "Whitehouse"),
+    ("David", "McCormick"), ("Kevin", "Hern"),
+]
+PRIORITY_DISPLAY = [f"{f} {l}" for f, l in PRIORITY_TRADERS]
+
+
+def is_priority(first: str, last: str) -> bool:
+    """Match on last name + a loose first-name check, to avoid both
+    false negatives (compound surnames) and false positives (common surnames
+    like 'Green' shared by non-priority members)."""
+    fl = (first or "").strip().lower()
+    ll = (last or "").strip().lower()
+    for pf, pl in PRIORITY_TRADERS:
+        if ll != pl.lower():
+            continue
+        pf = pf.lower()
+        # first names match if either is a prefix of the other (Ro/Rohit, Dave/David)
+        if not fl or fl.startswith(pf[:3]) or pf.startswith(fl[:3]):
+            return True
+    return False
+
+ALLOWED_SOURCES = [
+    "disclosures-clerk.house.gov (primary - House PTRs)",
+    "efts.senate.gov / efdsearch.senate.gov (primary - Senate PTRs)",
+    "quiverquant.com (verification)",
+    "opensecrets.org (verification)",
+    "official house.gov / senate.gov committee pages",
+]
+
+USER_AGENT = "CongressTradesMonitor/1.0 (personal weekly report)"
+
+
+# --------------------------------------------------------------------------- #
+# Telegram credentials
+# --------------------------------------------------------------------------- #
+
+def load_telegram_creds() -> tuple[str | None, str | None]:
+    """Prefer environment variables (GitHub Actions secrets); fall back to local JSON."""
+    token = os.environ.get("TELEGRAM_BOT_TOKEN")
+    chat = os.environ.get("TELEGRAM_CHAT_ID")
+    if token and chat:
+        return token, chat
+    if CONFIG_FILE.exists():
+        data = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
+        return data.get("bot_token"), str(data.get("chat_id"))
+    return None, None
+
+
+# --------------------------------------------------------------------------- #
+# Date window
+# --------------------------------------------------------------------------- #
+
+def last_completed_week(today: dt.date) -> tuple[dt.date, dt.date]:
+    """Return (Monday, Sunday) of the week immediately before `today`'s week."""
+    this_monday = today - dt.timedelta(days=today.weekday())
+    start = this_monday - dt.timedelta(days=7)
+    end = start + dt.timedelta(days=6)
+    return start, end
+
+
+def with_retries(fn, *, attempts: int = 3, base_delay: float = 2.0, what: str = "request"):
+    """Call fn(), retrying on any exception with exponential backoff."""
+    last = None
+    for i in range(1, attempts + 1):
+        try:
+            return fn()
+        except Exception as e:  # noqa: BLE001
+            last = e
+            if i < attempts:
+                wait = base_delay * (2 ** (i - 1))
+                print(f"  {what} failed (attempt {i}/{attempts}): {e} - retrying in {wait:.0f}s",
+                      file=sys.stderr)
+                time.sleep(wait)
+    raise last
+
+
+# --------------------------------------------------------------------------- #
+# House data
+# --------------------------------------------------------------------------- #
+
+def fetch_house_index(year: int) -> list[dict]:
+    """Download and parse the House FD index for `year`. Returns list of filing dicts."""
+    url = HOUSE_FD_ZIP.format(year=year)
+
+    def _get():
+        req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            return resp.read()
+
+    raw = with_retries(_get, what=f"House index {year}")
+    zf = zipfile.ZipFile(io.BytesIO(raw))
+    xml_name = next(n for n in zf.namelist() if n.lower().endswith(".xml"))
+    root = ET.fromstring(zf.read(xml_name))
+
+    filings = []
+    for m in root.findall("Member"):
+        def g(tag: str) -> str:
+            el = m.find(tag)
+            return (el.text or "").strip() if el is not None else ""
+        filings.append({
+            "prefix": g("Prefix"),
+            "last": g("Last"),
+            "first": g("First"),
+            "suffix": g("Suffix"),
+            "type": g("FilingType"),     # 'P' = Periodic Transaction Report
+            "state_dst": g("StateDst"),
+            "year": g("Year"),
+            "filing_date": g("FilingDate"),  # MM/DD/YYYY
+            "doc_id": g("DocID"),
+        })
+    return filings
+
+
+def parse_mmddyyyy(s: str) -> dt.date | None:
+    try:
+        return dt.datetime.strptime(s, "%m/%d/%Y").date()
+    except (ValueError, TypeError):
+        return None
+
+
+def ptrs_in_window(filings: list[dict], start: dt.date, end: dt.date) -> list[dict]:
+    out = []
+    for f in filings:
+        if f["type"] != "P":
+            continue
+        fd = parse_mmddyyyy(f["filing_date"])
+        if fd and start <= fd <= end:
+            f = dict(f)
+            f["filing_date_obj"] = fd
+            f["full_name"] = f"{f['first']} {f['last']}".strip()
+            f["is_priority"] = is_priority(f["first"], f["last"])
+            year = fd.year
+            f["pdf_url"] = HOUSE_PTR_PDF.format(year=year, doc=f["doc_id"])
+            out.append(f)
+    out.sort(key=lambda r: (not r["is_priority"], r["last"]))
+    return out
+
+
+# --------------------------------------------------------------------------- #
+# PTR PDF parsing  (extract per-trade detail from each official filing PDF)
+# --------------------------------------------------------------------------- #
+
+TXN_TYPE = {"P": "Buy", "S": "Sell", "E": "Exchange"}
+
+_ANCHOR = re.compile(
+    r"\b([PSE])\s*(?:\((?:partial|full)\))?\s+(\d{2}/\d{2}/\d{4})\s+(\d{2}/\d{2}/\d{4})(.*)"
+)
+_TICK_ADJ = re.compile(r"\(([A-Z0-9]{1,9})\)\s*\[([A-Z]{2})\]")
+_TICK_ANY = re.compile(r"\(([A-Z]{1,5})\)")
+_ASSET_TAG = re.compile(r"\[([A-Z]{2})\]")
+_MONEY = re.compile(r"\$[\d,]+")
+
+
+def amount_high(amount: str) -> int:
+    """Return the upper dollar bound of an amount range like '$15,001 - $50,000'."""
+    nums = [int(n.replace(",", "")) for n in re.findall(r"[\d,]+", amount)]
+    return max(nums) if nums else 0
+
+
+def download_pdf(url: str, dest: Path) -> Path:
+    def _get():
+        req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            return resp.read()
+
+    dest.write_bytes(with_retries(_get, what=f"PDF {dest.name}"))
+    return dest
+
+
+def parse_ptr_pdf(path: Path) -> list[dict]:
+    """Extract a list of trade dicts from a House PTR PDF's text layer."""
+    with pdfplumber.open(path) as pdf:
+        text = "\n".join((p.extract_text() or "") for p in pdf.pages)
+    lines = text.splitlines()
+    anchors = [i for i, ln in enumerate(lines) if _ANCHOR.search(ln)]
+    rows = []
+    for idx, i in enumerate(anchors):
+        m = _ANCHOR.search(lines[i])
+        ttype, tdate, ndate, _rest = m.groups()
+        end = anchors[idx + 1] if idx + 1 < len(anchors) else min(len(lines), i + 7)
+        window = " ".join(lines[i:end])
+
+        amts = _MONEY.findall(window)
+        amount = " - ".join(amts[:2]) if amts else "?"
+
+        tm = _TICK_ADJ.search(window)
+        if tm:
+            ticker, ctype = tm.groups()
+        else:
+            pm = _TICK_ANY.search(window)
+            cm = _ASSET_TAG.search(window)
+            ticker = pm.group(1) if pm else None
+            ctype = cm.group(1) if cm else None
+
+        name = window
+        tagm = _ASSET_TAG.search(window)
+        if tagm:
+            name = window[:tagm.start()]
+        name = _ANCHOR.split(name)[0]
+        name = re.sub(r"^(SP|JT|DC)\s+", "", name.strip())
+        name = re.sub(r"\s+", " ", name).strip(" -")
+
+        rows.append({
+            "asset": name[:55],
+            "ticker": ticker,
+            "asset_type": ctype,
+            "txn": TXN_TYPE.get(ttype, ttype),
+            "trade_date": tdate,
+            "notification_date": ndate,
+            "amount": amount,
+            "amount_high": amount_high(amount),
+        })
+    return rows
+
+
+def enrich_with_trades(ptrs: list[dict], errors: list[str]) -> list[dict]:
+    """Download each PTR PDF and attach parsed trades. Returns flat list of trades."""
+    cache = PROJECT_DIR / "_pdfs"
+    cache.mkdir(exist_ok=True)
+    all_trades = []
+    for p in ptrs:
+        p["trades"] = []
+        if not HAS_PDF:
+            continue
+        dest = cache / f"{p['doc_id']}.pdf"
+        try:
+            if not dest.exists():
+                download_pdf(p["pdf_url"], dest)
+            trades = parse_ptr_pdf(dest)
+            # the official filing/disclosure date is the index FilingDate (the date
+            # we actually filtered the window on) - normalise to MM/DD/YYYY.
+            fd = p.get("filing_date_obj")
+            disclosure = f"{fd:%m/%d/%Y}" if fd else p["filing_date"]
+            for t in trades:
+                t["filer"] = p["full_name"]
+                t["chamber"] = "House"
+                t["state_dst"] = p["state_dst"]
+                t["is_priority"] = p["is_priority"]
+                t["pdf_url"] = p["pdf_url"]
+                t["pdf_notification_date"] = t["notification_date"]  # keep for reference
+                t["notification_date"] = disclosure                  # in-window filing date
+            p["trades"] = trades
+            all_trades.extend(trades)
+        except Exception as e:  # noqa: BLE001
+            errors.append(f"PDF parse failed for {p['full_name']} (#{p['doc_id']}): {e}")
+    return all_trades
+
+
+def delay_days(t: dict) -> int | None:
+    td = parse_mmddyyyy(t["trade_date"])
+    nd = parse_mmddyyyy(t["notification_date"])
+    return (nd - td).days if td and nd else None
+
+
+# --------------------------------------------------------------------------- #
+# Senate data  (efdsearch.senate.gov - behind Akamai, needs curl_cffi)
+# --------------------------------------------------------------------------- #
+
+SENATE_BASE = "https://efdsearch.senate.gov"
+SENATE_LANDING = SENATE_BASE + "/search/"
+SENATE_HOME = SENATE_BASE + "/search/home/"
+SENATE_DATA = SENATE_BASE + "/search/report/data/"
+
+
+def _csrf(text: str) -> str | None:
+    m = re.search(r"name=['\"]csrfmiddlewaretoken['\"]\s+value=['\"]([^'\"]+)", text)
+    return m.group(1) if m else None
+
+
+class AkamaiBlocked(Exception):
+    """Raised when the Senate site denies access (Akamai bot protection)."""
+
+
+def _senate_session():
+    s = cffi_requests.Session(impersonate="chrome")
+
+    def _land():
+        r = s.get(SENATE_LANDING, timeout=30)
+        if r.status_code == 403 or "Access Denied" in r.text[:500]:
+            raise AkamaiBlocked(f"landing returned {r.status_code} (Akamai)")
+        return r
+
+    r = with_retries(_land, what="Senate landing")
+    token = _csrf(r.text) or s.cookies.get("csrftoken")
+    s.post(SENATE_HOME,
+           data={"prohibition_agreement": "1", "csrfmiddlewaretoken": token},
+           headers={"Referer": SENATE_LANDING}, timeout=30)
+    token = s.cookies.get("csrftoken") or token
+    return s, token
+
+
+def _senate_listing(s, token, start: dt.date, end: dt.date) -> list[dict]:
+    payload = {
+        "draw": "1", "start": "0", "length": "100",
+        "report_types": "[11]",          # 11 = Periodic Transaction Report
+        "filer_types": "[]",
+        "submitted_start_date": f"{start:%m/%d/%Y} 00:00:00",
+        "submitted_end_date": f"{end:%m/%d/%Y} 23:59:59",
+        "candidate_state": "", "senator_state": "", "office_id": "",
+        "first_name": "", "last_name": "",
+    }
+    r = s.post(SENATE_DATA, data=payload, headers={
+        "Referer": SENATE_LANDING, "X-CSRFToken": token,
+        "X-Requested-With": "XMLHttpRequest",
+    }, timeout=30)
+    out = []
+    for row in r.json().get("data", []):
+        first, last, office, link_html, date = (list(row) + [""] * 5)[:5]
+        href = re.search(r'href="([^"]+)"', link_html)
+        out.append({"first": first.strip(), "last": last.strip(),
+                    "office": office, "href": href.group(1) if href else None,
+                    "date": date.strip()})
+    return out
+
+
+def _senate_txn(t: str) -> str:
+    if t.startswith("Purchase"):
+        return "Buy"
+    if t.startswith("Sale"):
+        return "Sell"
+    if t.startswith("Exchange"):
+        return "Exchange"
+    return t
+
+
+def parse_senate_ptr(s, url: str) -> list[dict]:
+    """Parse the transaction table from an electronic Senate PTR view page."""
+    r = s.get(url, timeout=30)
+    trades = []
+    for row in re.findall(r"<tr[^>]*>(.*?)</tr>", r.text, re.S):
+        cells = re.findall(r"<t[dh][^>]*>(.*?)</t[dh]>", row, re.S)
+        cells = [re.sub(r"\s+", " ", html.unescape(re.sub(r"<[^>]+>", " ", c))).strip()
+                 for c in cells]
+        if len(cells) < 8 or not re.match(r"^\d+$", cells[0]):
+            continue
+        _num, tdate, _owner, ticker, asset, _atype, ttype, amount = cells[:8]
+        ticker = ticker if ticker and ticker != "--" else None
+        trades.append({
+            "asset": asset[:55],
+            "ticker": ticker,
+            "txn": _senate_txn(ttype),
+            "trade_date": tdate,
+            "amount": amount,
+            "amount_high": amount_high(amount),
+        })
+    return trades
+
+
+def fetch_senate_trades(start: dt.date, end: dt.date, errors: list[str]) -> list[dict]:
+    if not HAS_CURL:
+        errors.append("curl_cffi not installed - Senate trades NOT fetched. "
+                      "Install requirements.txt.")
+        return []
+    try:
+        s, token = _senate_session()
+        listing = with_retries(lambda: _senate_listing(s, token, start, end),
+                               what="Senate listing")
+    except AkamaiBlocked as e:
+        errors.append(f"Senate eFD blocked by Akamai bot protection ({e}). "
+                      "This can happen from datacenter IPs (e.g. GitHub Actions). "
+                      "House data is unaffected.")
+        return []
+    except Exception as e:  # noqa: BLE001
+        errors.append(f"Senate eFD query failed: {e}")
+        return []
+
+    all_trades = []
+    for f in listing:
+        full = f"{f['first']} {f['last']}".strip()
+        if not f["href"] or "/ptr/" not in f["href"]:
+            errors.append(f"Senate paper/non-electronic filing skipped (not parseable): {full}")
+            continue
+        url = SENATE_BASE + f["href"]
+        try:
+            ts = parse_senate_ptr(s, url)
+        except Exception as e:  # noqa: BLE001
+            errors.append(f"Senate PTR parse failed ({full}): {e}")
+            continue
+        for t in ts:
+            t["filer"] = full
+            t["chamber"] = "Senate"
+            t["state_dst"] = f["office"].split("(")[0].strip()[:14]
+            t["is_priority"] = is_priority(f["first"], f["last"])
+            t["notification_date"] = f["date"]  # Senate reports filing date, not per-row
+            t["pdf_url"] = url
+            all_trades.append(t)
+    return all_trades
+
+
+# --------------------------------------------------------------------------- #
+# Report rendering
+# --------------------------------------------------------------------------- #
+
+def _verify(t: dict) -> str:
+    """Markdown verify link to the official PTR PDF for a trade."""
+    return f"[verify]({t['pdf_url']})"
+
+
+def build_report(start: dt.date, end: dt.date, ptrs: list[dict],
+                 trades: list[dict], errors: list[str],
+                 senate_enabled: bool = False) -> str:
+    now = dt.datetime.now(dt.timezone.utc)
+    fmt = "%A, %B %d, %Y"
+    priority_hits = [p for p in ptrs if p["is_priority"]]
+    priority_trades = [t for t in trades if t["is_priority"]]
+    high_value = [t for t in trades if t["amount_high"] >= 250_000]
+    house_trades = [t for t in trades if t["chamber"] == "House"]
+    senate_trades = [t for t in trades if t["chamber"] == "Senate"]
+
+    lines: list[str] = []
+    w = lines.append
+
+    w("# U.S. Congress Stock Trade Disclosure - Weekly Monitor\n")
+    w(f"**Week Covered:** {start.strftime(fmt)} - {end.strftime(fmt)}  ")
+    w(f"**Generated On:** {now.strftime('%Y-%m-%dT%H:%M:%SZ')} (automated weekly run)\n")
+    w("---\n")
+
+    # Data access notice
+    w("## Data Access Notice\n")
+    w("House PTR detail is parsed from each filing's official PTR PDF "
+      "(disclosures-clerk.house.gov). Senate PTR detail is parsed from the "
+      "electronic filing pages on efdsearch.senate.gov. Every trade row links back "
+      "to its official source (PDF or filing page) for verification.\n")
+    w(f"**Verification result:** {len(trades)} individual trade(s) "
+      f"({len(house_trades)} House, {len(senate_trades)} Senate) with a filing date "
+      f"inside {start:%m/%d/%Y}-{end:%m/%d/%Y} were retrieved and parsed from the "
+      "official House Clerk and Senate eFD sources this cycle.\n")
+    w("---\n")
+
+    # Section 0 - priority
+    w("## Section 0. Priority Trader Activity\n")
+    w("**Monitored politicians:** " + ", ".join(PRIORITY_DISPLAY) + "\n")
+    if senate_enabled:
+        w("> Coverage: both **House** (disclosures-clerk.house.gov) and **Senate** "
+          "(efdsearch.senate.gov) electronic PTR filings are included. Senate "
+          "**paper** filings are scanned images and cannot be parsed - those are "
+          "logged in Section 5 if any appear.\n")
+    else:
+        w("> ⚠️ **Coverage note:** Senate scraping was disabled this run; House only.\n")
+    if not priority_trades:
+        w("> **No trades disclosed by priority traders this week.**\n")
+    else:
+        w("| Name | Ticker | Buy/Sell | Amount | Trade Date | Disclosure Date | Verify |")
+        w("|------|--------|----------|--------|------------|-----------------|--------|")
+        for t in priority_trades:
+            w(f"| {t['filer']} | {t['ticker'] or t['asset']} | {t['txn']} | {t['amount']} "
+              f"| {t['trade_date']} | {t['notification_date']} | {_verify(t)} |")
+        w("")
+    w("---\n")
+
+    # Section 1 - all trades (ticker-first, priority filers in bold)
+    w("## Section 1. Newly Disclosed Trades (filing date in window)\n")
+    w(f"*This report covers trades **disclosed** {start:%b %d} - {end:%b %d, %Y}. "
+      "The **Trade Date** is when the trade was executed (often weeks earlier - "
+      "members get up to 45 days to report); the **Disclosure Date** is when it was "
+      "filed with Congress and is always within this week's window.*\n")
+    w("*Priority traders shown in **bold** with a ⭐. Each row links to its official source.*\n")
+    if not trades:
+        w("*No individual trades were parsed from PTR filings inside the window this cycle.*\n")
+    else:
+        w("| Ticker | Buy/Sell | Trader | Amount | Trade Date | Disclosure Date | Asset | Verify |")
+        w("|--------|----------|--------|--------|------------|-----------------|-------|--------|")
+        ordered = sorted(trades, key=lambda t: (not t["is_priority"], t["filer"], t["ticker"] or "zzz"))
+        for t in ordered:
+            name = f"**⭐ {t['filer']}**" if t["is_priority"] else t["filer"]
+            w(f"| {t['ticker'] or '-'} | {t['txn']} | {name} | {t['amount']} "
+              f"| {t['trade_date']} | {t['notification_date']} | {t['asset']} | {_verify(t)} |")
+        w("")
+    w("---\n")
+
+    # Section 3 - high value
+    w("## Section 3. High-Value Trades (>= $250,000)\n")
+    if not high_value:
+        w("*No trades with an upper bound at or above $250,000 this week.*\n")
+    else:
+        w("| Filer | Ticker | Buy/Sell | Amount | Trade Date | Verify |")
+        w("|-------|--------|----------|--------|------------|--------|")
+        for t in high_value:
+            w(f"| {t['filer']} | {t['ticker'] or t['asset']} | {t['txn']} | {t['amount']} "
+              f"| {t['trade_date']} | {_verify(t)} |")
+        w("")
+    w("---\n")
+
+    # Section 4 - delayed disclosures
+    w("## Section 4. Delayed Disclosures (> 45 days, STOCK Act)\n")
+    delayed = [(t, delay_days(t)) for t in trades]
+    delayed = [(t, d) for t, d in delayed if d is not None and d > 45]
+    if not delayed:
+        w("*No trades exceeded the 45-day STOCK Act disclosure window this cycle.*\n")
+    else:
+        w("| Filer | Ticker | Trade Date | Disclosure Date | Delay (days) | Verify |")
+        w("|-------|--------|------------|-----------------|--------------|--------|")
+        for t, d in sorted(delayed, key=lambda x: -x[1]):
+            w(f"| {t['filer']} | {t['ticker'] or t['asset']} | {t['trade_date']} "
+              f"| {t['notification_date']} | {d} | {_verify(t)} |")
+        w("")
+    w("---\n")
+
+    # Section 5 - data gaps
+    w("## Section 5. Missing or Incomplete Data Log\n")
+    gaps = [
+        "Verification sources (quiverquant.com, opensecrets.org) are JS-rendered "
+        "and not cross-checked automatically.",
+        "Committee membership / sector mapping is not yet automated; committee-match "
+        "flag is informational only.",
+    ]
+    if not senate_enabled:
+        gaps.insert(0, "Senate eFD scraping was disabled this run (--no-senate).")
+    else:
+        gaps.insert(0, "Senate paper (non-electronic) filings are scanned images and "
+                       "cannot be parsed; only electronic Senate PTRs are included.")
+    if not HAS_PDF:
+        gaps.insert(0, "pdfplumber is not installed - per-trade detail was NOT parsed "
+                       "this run (filing-level only). Install requirements.txt.")
+    for e in errors:
+        gaps.append(f"Runtime issue: {e}")
+    for i, gtxt in enumerate(gaps, 1):
+        w(f"{i}. {gtxt}")
+    w("\n---\n")
+
+    # Section 6 - flags
+    w("## Section 6. Activity Flags\n")
+
+    status = "Triggered" if priority_trades else "Not triggered"
+    reason = (f"{len(priority_trades)} trade(s) by priority traders: "
+              + ", ".join(sorted({t['filer'] for t in priority_trades})) + "."
+              if priority_trades else
+              "No trades from the monitored politicians within the window.")
+    w(f"### FLAG_PRIORITY_TRADER_ACTIVITY\n**Status:** {status}  \n**Reason:** {reason}\n")
+
+    status = "Triggered" if high_value else "Not triggered"
+    reason = (f"{len(high_value)} trade(s) with an upper bound >= $250,000."
+              if high_value else "No trades >= $250,000 this week.")
+    w(f"### FLAG_LARGE_DISCLOSURE\n**Status:** {status}  \n**Reason:** {reason}\n")
+
+    # sector/ticker clustering: same ticker traded by 2+ different members
+    from collections import Counter
+    ticker_filers: dict[str, set] = {}
+    for t in trades:
+        if t["ticker"]:
+            ticker_filers.setdefault(t["ticker"], set()).add(t["filer"])
+    clustered = {tk: f for tk, f in ticker_filers.items() if len(f) >= 2}
+    status = "Triggered" if clustered else "Not triggered"
+    reason = ("; ".join(f"{tk} traded by {len(f)} members" for tk, f in clustered.items())
+              if clustered else
+              "No single ticker was traded by 2+ different members this week.")
+    w(f"### FLAG_SECTOR_CLUSTER\n**Status:** {status}  \n**Reason:** {reason}\n")
+
+    # repeated activity: same member 5+ trades
+    filer_counts = Counter(t["filer"] for t in trades)
+    heavy = {f: c for f, c in filer_counts.items() if c >= 5}
+    status = "Triggered" if heavy else "Not triggered"
+    reason = ("; ".join(f"{f}: {c} trades" for f, c in heavy.items())
+              if heavy else "No member disclosed 5+ trades this week.")
+    w(f"### FLAG_HIGH_ACTIVITY_TRADER\n**Status:** {status}  \n**Reason:** {reason}\n")
+
+    delayed_n = sum(1 for t in trades if (d := delay_days(t)) is not None and d > 45)
+    status = "Triggered" if delayed_n else "Not triggered"
+    reason = (f"{delayed_n} trade(s) disclosed more than 45 days after execution."
+              if delayed_n else "All parsed trades disclosed within 45 days.")
+    w(f"### FLAG_LATE_DISCLOSURE\n**Status:** {status}  \n**Reason:** {reason}\n")
+    w("---\n")
+
+    # Methodology
+    w("## Methodology & Source Log\n")
+    w("| Source | Role | Access This Cycle |")
+    w("|--------|------|-------------------|")
+    w("| disclosures-clerk.house.gov (index) | Primary (House PTRs) | Index parsed (machine-readable) |")
+    w("| disclosures-clerk.house.gov (PTR PDFs) | Primary (House detail) | "
+      f"{len(house_trades)} trades parsed from {len(ptrs)} filings |")
+    w("| efdsearch.senate.gov | Primary (Senate PTRs) | "
+      + (f"{len(senate_trades)} trades parsed (electronic filings)"
+         if senate_enabled else "Disabled this run") + " |")
+    w("| quiverquant.com / opensecrets.org | Verification | Not cross-checked - JS-rendered |")
+    w("\n---\n")
+    w("*Report generated automatically. No opinions, predictions, or trading "
+      "recommendations. Each trade links to its official source PDF for verification.*")
+
+    return "\n".join(lines)
+
+
+# --------------------------------------------------------------------------- #
+# Telegram delivery
+# --------------------------------------------------------------------------- #
+
+def tg_send(token: str, chat_id: str, text: str) -> dict:
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
+    payload = {"chat_id": chat_id, "text": text,
+               "parse_mode": "HTML", "disable_web_page_preview": "true"}
+    data = urllib.parse.urlencode(payload).encode()
+    req = urllib.request.Request(url, data=data, headers={"User-Agent": USER_AGENT})
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        return json.loads(resp.read().decode())
+
+
+def esc(s: str) -> str:
+    """Escape text for Telegram HTML parse mode."""
+    return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+def trade_line(t: dict) -> str:
+    """One trade as: TICKER - Buy/Sell - Trader (bold if priority) - amount - date - verify."""
+    head = esc(t["ticker"] or t["asset"])
+    name = esc(t["filer"])
+    if t["is_priority"]:
+        name = f"<b>⭐ {name}</b>"
+    chamber = "🏛H" if t["chamber"] == "House" else "🏛S"
+    side = "🟢 Buy" if t["txn"] == "Buy" else ("🔴 Sell" if t["txn"] == "Sell" else esc(t["txn"]))
+    amt = esc(t["amount"])
+    return (f"<b>{head}</b> - {side} - {name} ({chamber})\n"
+            f"   {amt} · {esc(t['trade_date'])} · "
+            f"<a href=\"{t['pdf_url']}\">verify</a>")
+
+
+def make_telegram_messages(start: dt.date, end: dt.date, ptrs: list[dict],
+                           trades: list[dict], senate_enabled: bool = False) -> list[str]:
+    """Build Telegram-friendly HTML messages (line based), chunked under 4096 chars."""
+    priority_trades = [t for t in trades if t["is_priority"]]
+    high_value = [t for t in trades if t["amount_high"] >= 250_000]
+    house_n = sum(1 for t in trades if t["chamber"] == "House")
+    senate_n = sum(1 for t in trades if t["chamber"] == "Senate")
+    fmt = "%b %d, %Y"
+
+    header = [
+        "📊 <b>Congress Trades - Weekly Report</b>",
+        f"Week: {start.strftime(fmt)} - {end.strftime(fmt)}",
+        f"Trades: {len(trades)} ({house_n} House, {senate_n} Senate)  |  "
+        f"High-value (≥$250k): {len(high_value)}",
+    ]
+    if priority_trades:
+        names = ", ".join(sorted({t["filer"] for t in priority_trades}))
+        header.append(f"⭐ Priority-trader trades: {len(priority_trades)} ({esc(names)})")
+    else:
+        header.append("⭐ No priority-trader trades this week.")
+    if not senate_enabled:
+        header.append("Note: Senate scraping disabled this run.")
+
+    # sort: priority first, then by filer, then ticker
+    ordered = sorted(trades, key=lambda t: (not t["is_priority"], t["filer"], t["ticker"] or "zzz"))
+    blocks = ["\n".join(header)]
+    blocks += [trade_line(t) for t in ordered]
+
+    # chunk blocks into messages under the 4096 limit
+    messages, cur = [], ""
+    for b in blocks:
+        piece = (b + "\n\n")
+        if len(cur) + len(piece) > 3800 and cur:
+            messages.append(cur.rstrip())
+            cur = ""
+        cur += piece
+    if cur.strip():
+        messages.append(cur.rstrip())
+    return messages
+
+
+def deliver(token: str, chat_id: str, messages: list[str]) -> None:
+    for i, msg in enumerate(messages, 1):
+        r = tg_send(token, chat_id, msg)
+        if not r.get("ok"):
+            raise RuntimeError(f"Telegram message {i} send failed: {r}")
+    print(f"Telegram: {len(messages)} message(s) sent.")
+
+
+# --------------------------------------------------------------------------- #
+# Main
+# --------------------------------------------------------------------------- #
+
+def run() -> int:
+    ap = argparse.ArgumentParser(description="Weekly Congress trade monitor")
+    ap.add_argument("--no-send", action="store_true", help="build report only; do not send to Telegram")
+    ap.add_argument("--no-pdf", action="store_true", help="skip House PDF parsing (filing-level only, faster)")
+    ap.add_argument("--no-senate", action="store_true", help="skip Senate eFD scraping")
+    ap.add_argument("--week", help="force a Monday start date, YYYY-MM-DD")
+    args = ap.parse_args()
+
+    today = dt.date.today()
+    if args.week:
+        start = dt.datetime.strptime(args.week, "%Y-%m-%d").date()
+        end = start + dt.timedelta(days=6)
+    else:
+        start, end = last_completed_week(today)
+
+    print(f"Reporting window: {start} -> {end}")
+
+    errors: list[str] = []
+    filings: list[dict] = []
+    # the window can straddle a year boundary; fetch both years' indexes if so
+    for year in sorted({start.year, end.year}):
+        try:
+            idx = fetch_house_index(year)
+            print(f"House index {year}: {len(idx)} filings")
+            filings.extend(idx)
+        except Exception as e:  # noqa: BLE001
+            msg = f"House index {year} fetch failed: {e}"
+            print(msg, file=sys.stderr)
+            errors.append(msg)
+
+    ptrs = ptrs_in_window(filings, start, end)
+    print(f"PTR filings in window: {len(ptrs)} "
+          f"({sum(p['is_priority'] for p in ptrs)} priority)")
+
+    if args.no_pdf:
+        for p in ptrs:
+            p["trades"] = []
+        trades: list[dict] = []
+        print("House PDF parsing skipped (--no-pdf).")
+    else:
+        if not HAS_PDF:
+            errors.append("pdfplumber not installed; House per-trade detail unavailable.")
+        trades = enrich_with_trades(ptrs, errors)
+        print(f"House trades parsed from PDFs: {len(trades)}")
+
+    senate_enabled = not args.no_senate
+    if senate_enabled:
+        senate_trades = fetch_senate_trades(start, end, errors)
+        print(f"Senate trades parsed: {len(senate_trades)}")
+        trades += senate_trades
+    else:
+        print("Senate scraping skipped (--no-senate).")
+
+    report = build_report(start, end, ptrs, trades, errors, senate_enabled)
+
+    REPORTS_DIR.mkdir(exist_ok=True)
+    out_file = REPORTS_DIR / f"congress-trades-{start:%Y-%m-%d}.md"
+    out_file.write_text(report, encoding="utf-8")
+    print(f"Report saved: {out_file}")
+
+    if args.no_send:
+        print("\n" + "=" * 60 + "\n")
+        print(report)
+        return 0
+
+    token, chat_id = load_telegram_creds()
+    if not token or not chat_id:
+        print("No Telegram credentials (env vars or telegram_config.json). "
+              "Report saved but not sent.", file=sys.stderr)
+        return 1
+
+    messages = make_telegram_messages(start, end, ptrs, trades, senate_enabled)
+    deliver(token, chat_id, messages)
+    return 0
+
+
+def main() -> int:
+    # make console output safe for emoji on Windows code pages
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, ValueError):
+            pass
+
+    try:
+        return run()
+    except Exception as e:  # noqa: BLE001 - last-resort: alert and fail loudly
+        import traceback
+        traceback.print_exc()
+        # try to alert via Telegram so a broken run is never silent
+        if "--no-send" not in sys.argv:
+            try:
+                token, chat_id = load_telegram_creds()
+                if token and chat_id:
+                    tg_send(token, chat_id,
+                            f"⚠️ <b>Congress Trades report FAILED</b>\n{esc(str(e)[:500])}")
+            except Exception:  # noqa: BLE001
+                pass
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

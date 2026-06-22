@@ -1,0 +1,13 @@
+# NEVER commit your real Telegram token
+telegram_config.json
+
+# generated reports (optional - remove if you want them in the repo)
+reports/
+
+# downloaded PTR PDFs (cache)
+_pdfs/
+
+# python
+__pycache__/
+*.pyc
+.venv/

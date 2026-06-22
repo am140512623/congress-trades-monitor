@@ -1,0 +1,36 @@
+name: Weekly Congress Trades Report
+
+on:
+  schedule:
+    # 05:04 UTC every Monday = 08:04 Qatar time (UTC+3, no DST).
+    # GitHub Actions cron is always UTC; Qatar = UTC+3, so subtract 3 hours.
+    - cron: "4 5 * * 1"
+  workflow_dispatch: {}   # lets you trigger it manually from the Actions tab
+
+jobs:
+  report:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run weekly report
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python congress_trades.py
+
+      - name: Upload report artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: congress-trades-report
+          path: reports/*.md
+          if-no-files-found: warn

@@ -1,0 +1,369 @@
+# U.S. Congress Stock Trade Disclosure — Weekly Monitor
+
+
+
+**Week Covered:** Monday, June 15, 2026 – Sunday, June 21, 2026  
+
+**Generated On:** 2026-06-22T00:00:00Z (automated Monday run)
+
+
+
+---
+
+
+
+## Data Access Notice
+
+
+
+The primary disclosure databases queried for this report:
+
+
+
+- **House Financial Disclosure Database** (`disclosures-clerk.house.gov`) — search interface is JavaScript-rendered; direct PTR document fetching was performed where PDF URLs were discoverable via search index.
+
+- **Senate Financial Disclosure Database** (`efts.senate.gov` / `efdsearch.senate.gov`) — search API endpoints require provenance from search results; no direct API query was achievable this cycle.
+
+
+
+All trade data in this report is sourced exclusively from: `disclosures-clerk.house.gov` (primary), `efts.senate.gov` (primary), `quiverquant.com` (verification), `opensecrets.org` (verification), official House/Senate committee pages. No other sources were used.
+
+
+
+**Verification result:** No Periodic Transaction Report (PTR) disclosures with a *disclosure date* (notification date or filing date) falling within June 15–21, 2026 were retrievable from the allowed sources via automated methods this cycle. Annual financial disclosures (holdings reports, not trade PTRs) were filed during the window by Rep. Cleo Fields (June 18, 2026) and Rep. Stephen F. Lynch (June 19, 2026), but these do not contain periodic transaction data and are excluded from the trade tables below.
+
+
+
+The most recently confirmed PTR filing found in the primary source (disclosures-clerk.house.gov) prior to the window was:
+
+- **Filing #20034762** — Hon. Chip Roy (TX-21), AESI partial sale (trade date: 05/13/2026, notification date: 05/13/2026, disclosure/signed date: 06/10/2026)
+
+
+
+---
+
+
+
+## Section 0. Priority Trader Activity
+
+
+
+**Monitored politicians:** Nancy Pelosi, Dan Crenshaw, Josh Gottheimer, Ro Khanna, Tommy Tuberville, Mark Green, Debbie Wasserman Schultz, Sheldon Whitehouse, David McCormick, Kevin Hern
+
+
+
+> **No trades disclosed by priority traders this week.**
+
+>
+
+> No PTR filings from any of the 10 priority-monitored politicians were found with a disclosure date of June 15–21, 2026 via the allowed sources.
+
+
+
+**Most recent confirmed priority-trader disclosure (outside this window, for reference):**
+
+
+
+| Name | Ticker | Buy/Sell | Amount Range | Trade Date | Disclosure Date | Source |
+
+|------|--------|----------|-------------|------------|-----------------|--------|
+
+| Sheldon Whitehouse (Senate) | NVDA | Sell | $100,001–$250,000 | 05/08/2026 | 06/02/2026 | MarketBeat/Senate EFTS |
+
+
+
+*(Note: Whitehouse NVDA trade disclosed June 2, 2026 — outside the June 15–21 reporting window. Listed here for reference only; excluded from all flag calculations for this week.)*
+
+
+
+---
+
+
+
+## Section 1. Newly Disclosed Trades (June 15–21, 2026)
+
+
+
+*No PTR trade disclosures with a disclosure date falling within June 15–21, 2026 were confirmed from the allowed sources for this reporting cycle.*
+
+
+
+| Name | Chamber | Party | Committee(s) | Ticker | Company | Sector | Buy/Sell | Amount Range | Trade Date | Disclosure Date | Committee Related to Sector? | Source(s) |
+
+|------|---------|-------|--------------|--------|---------|--------|----------|-------------|------------|-----------------|------------------------------|-----------|
+
+| — | — | — | — | — | — | — | — | — | — | — | — | — |
+
+
+
+---
+
+
+
+## Section 2. Committee Relevance Summary
+
+
+
+*No verified trade disclosures this week. Table cannot be populated.*
+
+
+
+| Committee | # Trades by Members | # Related | # Unrelated | # Unclear |
+
+|-----------|--------------------|-----------|-----------| ---------|
+
+| — | 0 | 0 | 0 | 0 |
+
+
+
+---
+
+
+
+## Section 3. High-Value Trades (≥ $250,000) — June 15–21, 2026
+
+
+
+*No trades at or above $250,000 were verified within the reporting window.*
+
+
+
+| Name | Committee(s) | Ticker | Sector | Buy/Sell | Amount Range | Trade Date | Related? | Source |
+
+|------|-------------|--------|--------|----------|-------------|------------|---------|--------|
+
+| — | — | — | — | — | — | — | — | — |
+
+
+
+---
+
+
+
+## Section 4. Delayed Disclosures
+
+
+
+*Delay analysis requires a confirmed trade date and disclosure date within or near the reporting window. No qualifying PTR disclosures were found for this week.*
+
+
+
+| Name | Ticker | Trade Date | Disclosure Date | Delay (Days) |
+
+|------|--------|------------|-----------------|-------------|
+
+| — | — | — | — | — |
+
+
+
+**Note:** The most recent verified PTR prior to this window (Chip Roy, AESI, trade: 05/13/2026, filed: 06/10/2026) shows a 28-day delay — within the 45-day STOCK Act requirement.
+
+
+
+---
+
+
+
+## Section 5. Missing or Incomplete Data Log
+
+
+
+The following data gaps affected this report:
+
+
+
+1. **Primary source inaccessibility (House):** `disclosures-clerk.house.gov` search interface is JavaScript-rendered. PTR PDFs with filing IDs above #20034762 (the last confirmed filing from prior to the window, dated 06/10/2026) could not be enumerated without URL provenance from the search index. Sequential ID probing (e.g., #20034800–#20035000) returned no search results.
+
+
+
+2. **Primary source inaccessibility (Senate):** `efts.senate.gov` and `efdsearch.senate.gov` search endpoints require URL provenance; direct API queries were blocked by the web_fetch provenance restriction. No Senate PTR filings from June 15–21, 2026 could be confirmed.
+
+
+
+3. **Verification source rendering:** `quiverquant.com` trade tables are JavaScript-rendered and returned no trade-level data in static HTML. Quiver news articles from this week (June 18–19, 2026) covered only annual financial disclosures (Cleo Fields, Stephen Lynch), not PTRs.
+
+
+
+4. **Annual disclosure filings during window (not PTRs):**
+
+   - Rep. Cleo Fields (LA-02) — Annual financial disclosure filed 06/18/2026 (holdings; no new trades disclosed)
+
+   - Rep. Stephen F. Lynch (MA-08) — Annual financial disclosure filed 06/19/2026 (holdings; no new trades disclosed)
+
+
+
+5. **Priority trader committee membership:** Not re-verified this cycle. Refer to prior week's report or official committee pages (house.gov, senate.gov) for current assignments.
+
+
+
+---
+
+
+
+## Section 6. Activity Flags
+
+
+
+### FLAG_PRIORITY_TRADER_ACTIVITY
+
+**Status:** Not triggered  
+
+**Reason:** No confirmed PTR trade disclosures from the 10 priority-monitored politicians within the June 15–21, 2026 window.
+
+
+
+---
+
+
+
+### FLAG_SECTOR_CLUSTER
+
+**Status:** Not triggered  
+
+**Reason:** Insufficient verified trades this week (zero confirmed).
+
+
+
+---
+
+
+
+### FLAG_REPEATED_WEEKLY_PURCHASE
+
+**Status:** Not triggered  
+
+**Reason:** Insufficient verified trades this week.
+
+
+
+---
+
+
+
+### FLAG_LARGE_DISCLOSURE
+
+**Status:** Not triggered  
+
+**Reason:** No verified trades ≥ $250,000 within the window.
+
+
+
+---
+
+
+
+### FLAG_COMMITTEE_SECTOR_MATCH
+
+**Status:** Not triggered  
+
+**Reason:** No verified trades from committee members within the window.
+
+
+
+---
+
+
+
+### FLAG_MULTI_WEEK_ACCUMULATION
+
+**Status:** not verified  
+
+**Reason:** Insufficient historical records retrievable this cycle; primary source databases were not fully queryable.
+
+
+
+---
+
+
+
+### FLAG_CROSS_POLITICIAN_COORDINATION
+
+**Status:** Not triggered  
+
+**Reason:** Zero confirmed buy trades by any politician within the window.
+
+
+
+---
+
+
+
+### FLAG_SECTOR_ROTATION
+
+**Status:** not verified  
+
+**Reason:** Insufficient historical data; prior 4-week sector buy counts could not be computed from available sources this cycle.
+
+
+
+---
+
+
+
+### FLAG_LEGISLATIVE_CATALYST
+
+**Status:** not verified  
+
+**Reason:** Insufficient trade data to match against legislative activity. No verified trades to cross-reference with active bills or committee hearings. (Active legislation noted: H.R.3633 Digital Asset Market Clarity Act text updated 06/21/2026 — Congress.gov. No confirmed congressional trades in digital asset/crypto sector this week to match against.)
+
+
+
+---
+
+
+
+## Methodology & Source Log
+
+
+
+| Source | Role | Access Status This Cycle | URLs Queried |
+
+|--------|------|--------------------------|-------------|
+
+| disclosures-clerk.house.gov | Primary (House PTRs) | Partial — JS-rendered search; direct PDF access limited to known URLs | Multiple PTR PDFs (#20033725, #20034285, #20034519, #20034622, #20034712, #20034762) |
+
+| efts.senate.gov / efdsearch.senate.gov | Primary (Senate PTRs) | Not accessible — provenance restriction | None |
+
+| quiverquant.com | Verification | Partial — news articles accessible; trade tables JS-rendered | Multiple news/politician pages |
+
+| opensecrets.org | Verification | Not accessible — URL not in provenance | None |
+
+| house.gov (committee pages) | Verification | Searched via web search; not directly fetched | N/A |
+
+| senate.gov (committee pages) | Verification | Searched via web search; not directly fetched | N/A |
+
+
+
+---
+
+
+
+## Confirmed PTR Filings Retrieved This Cycle (All Sources, Any Date)
+
+
+
+| Filing ID | Filer | Ticker | Trade | Trade Date | Disclosure Date | Amount | Notes |
+
+|-----------|-------|--------|-------|------------|-----------------|--------|-------|
+
+| #20033725 | Nancy Pelosi (CA-11) | GOOGL, AMZN, AAPL, NVDA, AB, PYPL, TEM, VSNT, VST, DIS | Mixed | 12/24/2025–01/16/2026 | 01/23/2026 | $15,001–$25,000,000+ | Outside window |
+
+| #20034519 | Jonathan Jackson (IL-01) | ORLY, SPG, THC, V | Sell/Buy | 04/15–04/24/2026 | 05/27/2026 | $1,001–$100,000 | Outside window |
+
+| #20034622 | Jake Auchincloss (MA-04) | Not yet retrieved | — | 05/18/2026 | not retrieved | — | Outside window |
+
+| #20034712 | Lloyd Doggett (TX-37) | PG | Buy (dividend reinvest) | 05/15/2026 | 06/04/2026 | $1,001–$15,000 | Outside window |
+
+| #20034762 | Chip Roy (TX-21) | AESI | Sell (partial) | 05/13/2026 | 06/10/2026 | $100,001–$250,000 | Outside window |
+
+
+
+*No PTR filings with a disclosure date of June 15–21, 2026 were confirmed from the allowed sources.*
+
+
+
+---
+
+
+
+*Report generated automatically. No opinions, predictions, or trading recommendations. Data reflects only what was verifiable from the allowed sources at time of generation. Users requiring comprehensive coverage should query disclosures-clerk.house.gov and efdsearch.senate.gov directly.*
