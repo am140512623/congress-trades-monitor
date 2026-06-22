@@ -57,11 +57,25 @@ No dependencies — Python 3.10+ standard library only.
 - Priority-trader watchlist (House + Senate) is in `PRIORITY_TRADERS` in
   `congress_trades.py`. Senators in the list: Tuberville, Whitehouse, McCormick.
 
+### Performance tracker (`portfolio.csv`)
+
+Every **buy** opens a position in `portfolio.csv`, recording the price on the
+trade date (`entry_price`) and on the disclosure date (`disclosure_price` — the
+earliest a follower could have bought). Each run refreshes `current_price` and
+`ret_since_disclosure_pct` for open positions. When the same member later
+**sells** that ticker, the matching open position is **closed** and realized
+returns are recorded. Prices come from yfinance; Treasuries/CUSIPs and tickers
+without price data are skipped.
+
+The GitHub Actions run commits the updated `portfolio.csv` back to the repo each
+week, so the history accumulates automatically — just open the file to review it.
+
 ### Useful flags
 
 ```bash
 python congress_trades.py --no-send     # preview only, no Telegram
 python congress_trades.py --no-senate   # House only (skip Senate)
 python congress_trades.py --no-pdf      # House filing-level only (fast)
+python congress_trades.py --no-track    # skip portfolio.csv price tracking
 python congress_trades.py --week 2026-06-15
 ```

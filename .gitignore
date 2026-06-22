@@ -6,6 +6,8 @@ reports/
 
 # downloaded PTR PDFs (cache)
 _pdfs/
+# yfinance timezone cache
+_yfcache/
 
 # python
 __pycache__/

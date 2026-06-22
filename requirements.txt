@@ -3,3 +3,5 @@ pdfplumber>=0.11
 # Senate eFD site (efdsearch.senate.gov) sits behind Akamai bot protection;
 # curl_cffi impersonates a real Chrome TLS fingerprint to access it.
 curl_cffi>=0.7
+# Stock price history for the performance tracker (portfolio.csv).
+yfinance>=0.2.40

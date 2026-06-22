@@ -39,13 +39,14 @@ jobs:
           path: reports/*.md
           if-no-files-found: warn
 
-      # Heartbeat: a weekly commit keeps the repo "active" so GitHub never
-      # auto-pauses the schedule (it disables crons after 60 idle days).
-      - name: Keep schedule alive (heartbeat commit)
+      # Commit the updated portfolio.csv + a heartbeat. The weekly commit also
+      # keeps the repo "active" so GitHub never auto-pauses the schedule
+      # (it disables crons after 60 idle days).
+      - name: Persist portfolio + keep schedule alive
         run: |
           date -u +"Last automated run: %Y-%m-%dT%H:%M:%SZ" > last_run.txt
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add last_run.txt
-          git commit -m "chore: weekly heartbeat [skip ci]" || echo "nothing to commit"
+          git add last_run.txt portfolio.csv
+          git commit -m "chore: weekly portfolio update + heartbeat [skip ci]" || echo "nothing to commit"
           git push

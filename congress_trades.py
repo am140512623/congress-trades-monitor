@@ -55,6 +55,14 @@ try:
 except ImportError:
     HAS_COMMITTEES = False
 
+try:
+    import tracker  # performance tracking of buy positions -> portfolio.csv
+    HAS_TRACKER = True
+except ImportError:
+    HAS_TRACKER = False
+
+PORTFOLIO_FILE = Path(__file__).resolve().parent / "portfolio.csv"
+
 # --------------------------------------------------------------------------- #
 # Config
 # --------------------------------------------------------------------------- #
@@ -841,6 +849,7 @@ def run() -> int:
     ap.add_argument("--no-send", action="store_true", help="build report only; do not send to Telegram")
     ap.add_argument("--no-pdf", action="store_true", help="skip House PDF parsing (filing-level only, faster)")
     ap.add_argument("--no-senate", action="store_true", help="skip Senate eFD scraping")
+    ap.add_argument("--no-track", action="store_true", help="skip portfolio.csv performance tracking")
     ap.add_argument("--week", help="force a Monday start date, YYYY-MM-DD")
     args = ap.parse_args()
 
@@ -892,6 +901,21 @@ def run() -> int:
     tag_committees(trades, errors)
     n_match = sum(1 for t in trades if t.get("committee_match"))
     print(f"Committee-sector matches: {n_match}")
+
+    # attach a clean company name for tracker/CSV
+    for t in trades:
+        t["company"] = short_company(t["asset"], t["ticker"])
+
+    if not args.no_track:
+        if HAS_TRACKER:
+            summary = tracker.update(PORTFOLIO_FILE, trades, errors)
+            print(f"Tracker: {summary['opened']} opened, {summary['closed']} closed, "
+                  f"{summary['updated']} refreshed, {summary['skipped']} skipped "
+                  f"(portfolio total: {summary['total']})")
+        else:
+            errors.append("tracker.py / yfinance unavailable - tracking skipped.")
+    else:
+        print("Performance tracking skipped (--no-track).")
 
     report = build_report(start, end, ptrs, trades, errors, senate_enabled)
 
