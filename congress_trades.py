@@ -49,6 +49,12 @@ try:
 except ImportError:
     HAS_CURL = False
 
+try:
+    from committees import CommitteeIndex  # committee tagging + sector-match flag
+    HAS_COMMITTEES = True
+except ImportError:
+    HAS_COMMITTEES = False
+
 # --------------------------------------------------------------------------- #
 # Config
 # --------------------------------------------------------------------------- #
@@ -299,6 +305,8 @@ def enrich_with_trades(ptrs: list[dict], errors: list[str]) -> list[dict]:
             disclosure = f"{fd:%m/%d/%Y}" if fd else p["filing_date"]
             for t in trades:
                 t["filer"] = p["full_name"]
+                t["first"] = p["first"]
+                t["last"] = p["last"]
                 t["chamber"] = "House"
                 t["state_dst"] = p["state_dst"]
                 t["is_priority"] = p["is_priority"]
@@ -316,6 +324,32 @@ def delay_days(t: dict) -> int | None:
     td = parse_mmddyyyy(t["trade_date"])
     nd = parse_mmddyyyy(t["notification_date"])
     return (nd - td).days if td and nd else None
+
+
+def tag_committees(trades: list[dict], errors: list[str]) -> None:
+    """Attach committee memberships + sector-match info to each trade (in place)."""
+    for t in trades:
+        t.setdefault("committees", [])
+        t.setdefault("committee_match", [])
+    if not HAS_COMMITTEES:
+        errors.append("committees.py unavailable - committee tagging skipped.")
+        return
+    try:
+        idx = with_retries(CommitteeIndex, what="committee data", attempts=2)
+    except Exception as e:  # noqa: BLE001
+        errors.append(f"Committee data fetch failed - tagging skipped: {e}")
+        return
+    # cache per (filer, chamber) to avoid repeat lookups
+    cache: dict[tuple, list[str]] = {}
+    for t in trades:
+        first = t.get("first", "")
+        last = t.get("last", "")
+        state = t["state_dst"][:2] if t["chamber"] == "House" else ""
+        key = (t["filer"], t["chamber"])
+        if key not in cache:
+            cache[key] = idx.committees_for(first, last, state, t["chamber"])
+        t["committees"] = cache[key]
+        t["committee_match"] = idx.committee_sector_matches(t["committees"], t["ticker"])
 
 
 # --------------------------------------------------------------------------- #
@@ -444,6 +478,8 @@ def fetch_senate_trades(start: dt.date, end: dt.date, errors: list[str]) -> list
             continue
         for t in ts:
             t["filer"] = full
+            t["first"] = f["first"]
+            t["last"] = f["last"]
             t["chamber"] = "Senate"
             t["state_dst"] = f["office"].split("(")[0].strip()[:14]
             t["is_priority"] = is_priority(f["first"], f["last"])
@@ -524,13 +560,34 @@ def build_report(start: dt.date, end: dt.date, ptrs: list[dict],
     if not trades:
         w("*No individual trades were parsed from PTR filings inside the window this cycle.*\n")
     else:
-        w("| Ticker | Buy/Sell | Trader | Amount | Trade Date | Disclosure Date | Asset | Verify |")
-        w("|--------|----------|--------|--------|------------|-----------------|-------|--------|")
+        w("| Ticker | Buy/Sell | Trader | Amount | Trade Date | Disclosure Date | Committee? | Verify |")
+        w("|--------|----------|--------|--------|------------|-----------------|-----------|--------|")
         ordered = sorted(trades, key=lambda t: (not t["is_priority"], t["filer"], t["ticker"] or "zzz"))
         for t in ordered:
             name = f"**⭐ {t['filer']}**" if t["is_priority"] else t["filer"]
+            match = (f"⚖️ {t['committee_match'][0][1]}" if t.get("committee_match") else "-")
             w(f"| {t['ticker'] or '-'} | {t['txn']} | {name} | {t['amount']} "
-              f"| {t['trade_date']} | {t['notification_date']} | {t['asset']} | {_verify(t)} |")
+              f"| {t['trade_date']} | {t['notification_date']} | {match} | {_verify(t)} |")
+        w("")
+    w("---\n")
+
+    # Section 2 - committee relevance (trades where a committee oversees the sector)
+    w("## Section 2. Committee Relevance\n")
+    w("*Heuristic: a trade is flagged when the trader sits on a committee whose "
+      "jurisdiction broadly covers the stock's sector. Not a determination of "
+      "wrongdoing - just a signal worth a look.*\n")
+    matched = [t for t in trades if t.get("committee_match")]
+    if not matched:
+        w("*No committee-sector overlaps detected this week (among tickers with a "
+          "known sector).*\n")
+    else:
+        w("| Trader | Ticker | Sector | Relevant Committee | Buy/Sell | Amount | Verify |")
+        w("|--------|--------|--------|--------------------|----------|--------|--------|")
+        for t in sorted(matched, key=lambda x: x["filer"]):
+            com, sec = t["committee_match"][0]
+            name = f"**⭐ {t['filer']}**" if t["is_priority"] else t["filer"]
+            w(f"| {name} | {t['ticker']} | {sec} | {com} | {t['txn']} | {t['amount']} "
+              f"| {_verify(t)} |")
         w("")
     w("---\n")
 
@@ -567,8 +624,8 @@ def build_report(start: dt.date, end: dt.date, ptrs: list[dict],
     gaps = [
         "Verification sources (quiverquant.com, opensecrets.org) are JS-rendered "
         "and not cross-checked automatically.",
-        "Committee membership / sector mapping is not yet automated; committee-match "
-        "flag is informational only.",
+        "Committee-sector matching is heuristic: it covers tickers with a known "
+        "sector and broad committee jurisdictions, not exhaustive coverage.",
     ]
     if not senate_enabled:
         gaps.insert(0, "Senate eFD scraping was disabled this run (--no-senate).")
@@ -625,6 +682,20 @@ def build_report(start: dt.date, end: dt.date, ptrs: list[dict],
     reason = (f"{delayed_n} trade(s) disclosed more than 45 days after execution."
               if delayed_n else "All parsed trades disclosed within 45 days.")
     w(f"### FLAG_LATE_DISCLOSURE\n**Status:** {status}  \n**Reason:** {reason}\n")
+
+    # committee-sector match (heuristic)
+    cm = [t for t in trades if t.get("committee_match")]
+    status = "Triggered" if cm else "Not triggered"
+    if cm:
+        examples = "; ".join(
+            f"{t['filer']} traded {t['ticker']} ({t['committee_match'][0][1]}) - "
+            f"sits on {t['committee_match'][0][0]}"
+            for t in cm[:5])
+        reason = f"{len(cm)} trade(s) overlap a trader's committee jurisdiction. {examples}"
+    else:
+        reason = ("No committee-sector overlaps among tickers with a known sector "
+                  "(committee tagging unavailable counts as none).")
+    w(f"### FLAG_COMMITTEE_SECTOR_MATCH\n**Status:** {status}  \n**Reason:** {reason}\n")
     w("---\n")
 
     # Methodology
@@ -673,7 +744,10 @@ def trade_line(t: dict) -> str:
     chamber = "🏛H" if t["chamber"] == "House" else "🏛S"
     side = "🟢 Buy" if t["txn"] == "Buy" else ("🔴 Sell" if t["txn"] == "Sell" else esc(t["txn"]))
     amt = esc(t["amount"])
-    return (f"<b>{head}</b> - {side} - {name} ({chamber})\n"
+    match = ""
+    if t.get("committee_match"):
+        match = f" ⚖️ <i>{esc(t['committee_match'][0][1])} committee</i>"
+    return (f"<b>{head}</b> - {side} - {name} ({chamber}){match}\n"
             f"   {amt} · {esc(t['trade_date'])} · "
             f"<a href=\"{t['pdf_url']}\">verify</a>")
 
@@ -783,6 +857,10 @@ def run() -> int:
         trades += senate_trades
     else:
         print("Senate scraping skipped (--no-senate).")
+
+    tag_committees(trades, errors)
+    n_match = sum(1 for t in trades if t.get("committee_match"))
+    print(f"Committee-sector matches: {n_match}")
 
     report = build_report(start, end, ptrs, trades, errors, senate_enabled)
 
