@@ -498,6 +498,22 @@ def _verify(t: dict) -> str:
     return f"[verify]({t['pdf_url']})"
 
 
+_CO_BOILERPLATE = re.compile(
+    r"\b(Common Stock|Ordinary Shares?|Class [A-C]|Corporation|Incorporated|"
+    r"Inc\.?|plc|Company|Co\.?|Ltd\.?|L\.?P\.?|Holdings?|Group|Trust|Fund|"
+    r"ETF Shares?)\b.*$", re.I)
+
+
+def short_company(asset: str, ticker: str | None = None) -> str:
+    """Turn a verbose asset name into a short, readable company name.
+    e.g. 'NVIDIA Corporation - Common Stock' -> 'NVIDIA'."""
+    s = re.sub(r"\s*\([A-Za-z0-9.\- ]+\)\s*", " ", asset or "")  # drop parentheticals
+    s = s.split(" - ")[0]
+    s = _CO_BOILERPLATE.sub("", s).strip(" ,-")
+    s = re.sub(r"\s+", " ", s).strip()
+    return s[:24] or (ticker or "")
+
+
 def build_report(start: dt.date, end: dt.date, ptrs: list[dict],
                  trades: list[dict], errors: list[str],
                  senate_enabled: bool = False) -> str:
@@ -560,14 +576,15 @@ def build_report(start: dt.date, end: dt.date, ptrs: list[dict],
     if not trades:
         w("*No individual trades were parsed from PTR filings inside the window this cycle.*\n")
     else:
-        w("| Ticker | Buy/Sell | Trader | Amount | Trade Date | Disclosure Date | Committee? | Verify |")
-        w("|--------|----------|--------|--------|------------|-----------------|-----------|--------|")
+        w("| Flags | Ticker | Company | Buy/Sell | Trader | Amount | Trade Date | Disclosure Date | Verify |")
+        w("|-------|--------|---------|----------|--------|--------|------------|-----------------|--------|")
         ordered = sorted(trades, key=lambda t: (not t["is_priority"], t["filer"], t["ticker"] or "zzz"))
         for t in ordered:
-            name = f"**⭐ {t['filer']}**" if t["is_priority"] else t["filer"]
-            match = (f"⚖️ {t['committee_match'][0][1]}" if t.get("committee_match") else "-")
-            w(f"| {t['ticker'] or '-'} | {t['txn']} | {name} | {t['amount']} "
-              f"| {t['trade_date']} | {t['notification_date']} | {match} | {_verify(t)} |")
+            name = f"**{t['filer']}**" if t["is_priority"] else t["filer"]
+            flags = ("⭐" if t["is_priority"] else "") + ("⚖️" if t.get("committee_match") else "")
+            company = short_company(t["asset"], t["ticker"])
+            w(f"| {flags or '-'} | {t['ticker'] or '-'} | {company} | {t['txn']} | {name} "
+              f"| {t['amount']} | {t['trade_date']} | {t['notification_date']} | {_verify(t)} |")
         w("")
     w("---\n")
 
@@ -736,19 +753,32 @@ def esc(s: str) -> str:
 
 
 def trade_line(t: dict) -> str:
-    """One trade as: TICKER - Buy/Sell - Trader (bold if priority) - amount - date - verify."""
-    head = esc(t["ticker"] or t["asset"])
+    """One trade, markers FIRST so priority/committee signals are unmissable:
+
+    ⭐⚖️ NVDA (NVIDIA) - 🔴 Sell - Nancy Pelosi
+        $1,001-$15,000 · traded 06/16 · ⚖️ tech committee · verify
+    """
+    # leading markers - most important signals, before the ticker
+    markers = ""
+    if t["is_priority"]:
+        markers += "⭐"
+    if t.get("committee_match"):
+        markers += "⚖️"
+    markers = (markers + " ") if markers else ""
+
+    ticker = esc(t["ticker"] or "—")
+    company = esc(short_company(t["asset"], t["ticker"]))
     name = esc(t["filer"])
     if t["is_priority"]:
-        name = f"<b>⭐ {name}</b>"
-    chamber = "🏛H" if t["chamber"] == "House" else "🏛S"
+        name = f"<b>{name}</b>"
+    chamber = "House" if t["chamber"] == "House" else "Senate"
     side = "🟢 Buy" if t["txn"] == "Buy" else ("🔴 Sell" if t["txn"] == "Sell" else esc(t["txn"]))
     amt = esc(t["amount"])
-    match = ""
+    note = ""
     if t.get("committee_match"):
-        match = f" ⚖️ <i>{esc(t['committee_match'][0][1])} committee</i>"
-    return (f"<b>{head}</b> - {side} - {name} ({chamber}){match}\n"
-            f"   {amt} · {esc(t['trade_date'])} · "
+        note = f"⚖️ <i>{esc(t['committee_match'][0][1])} committee</i> · "
+    return (f"{markers}<b>{ticker}</b> ({company}) - {side} - {name} ({chamber})\n"
+            f"   {amt} · traded {esc(t['trade_date'])} · {note}"
             f"<a href=\"{t['pdf_url']}\">verify</a>")
 
 
@@ -774,6 +804,7 @@ def make_telegram_messages(start: dt.date, end: dt.date, ptrs: list[dict],
         header.append("⭐ No priority-trader trades this week.")
     if not senate_enabled:
         header.append("Note: Senate scraping disabled this run.")
+    header.append("<i>Legend: ⭐ = priority trader · ⚖️ = trades their committee's sector</i>")
 
     # sort: priority first, then by filer, then ticker
     ordered = sorted(trades, key=lambda t: (not t["is_priority"], t["filer"], t["ticker"] or "zzz"))
