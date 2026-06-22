@@ -30,6 +30,7 @@ except Exception:  # noqa: BLE001
 
 FIELDNAMES = [
     "id", "filer", "chamber", "ticker", "company",
+    "priority", "committee_sector", "relevant_committee",
     "trade_date", "disclosure_date", "amount",
     "entry_price", "disclosure_price", "status",
     "sell_trade_date", "sell_disclosure_date", "sell_price",
@@ -148,26 +149,34 @@ def update(path: Path, trades: list[dict], errors: list[str]) -> dict:
     # 1) open new buy positions
     for t in buys:
         tid = _trade_id(t)
-        if tid in rows:
-            continue
-        entry = px.on(t["ticker"], t["trade_date"])
-        disc = px.on(t["ticker"], t["notification_date"])
-        rows[tid] = {
-            "id": tid, "filer": t["filer"], "chamber": t["chamber"],
-            "ticker": t["ticker"],
-            "company": t.get("company") or t["asset"][:24],
-            "trade_date": t["trade_date"], "disclosure_date": t["notification_date"],
-            "amount": t["amount"],
-            "entry_price": entry if entry is not None else "",
-            "disclosure_price": disc if disc is not None else "",
-            "status": "open",
-            "sell_trade_date": "", "sell_disclosure_date": "", "sell_price": "",
-            "current_price": "", "current_date": "",
-            "ret_since_disclosure_pct": "", "ret_since_entry_pct": "",
-            "realized_disclosure_pct": "", "realized_entry_pct": "",
-            "last_updated": today,
-        }
-        opened += 1
+        if tid not in rows:
+            entry = px.on(t["ticker"], t["trade_date"])
+            disc = px.on(t["ticker"], t["notification_date"])
+            rows[tid] = {
+                "id": tid, "filer": t["filer"], "chamber": t["chamber"],
+                "ticker": t["ticker"],
+                "company": t.get("company") or t["asset"][:24],
+                "trade_date": t["trade_date"], "disclosure_date": t["notification_date"],
+                "amount": t["amount"],
+                "entry_price": entry if entry is not None else "",
+                "disclosure_price": disc if disc is not None else "",
+                "status": "open",
+                "sell_trade_date": "", "sell_disclosure_date": "", "sell_price": "",
+                "current_price": "", "current_date": "",
+                "ret_since_disclosure_pct": "", "ret_since_entry_pct": "",
+                "realized_disclosure_pct": "", "realized_entry_pct": "",
+                "last_updated": today,
+            }
+            opened += 1
+        # always (re)set flag metadata - backfills rows on schema changes too
+        r = rows[tid]
+        r["priority"] = "yes" if t.get("is_priority") else ""
+        if t.get("committee_match"):
+            r["committee_sector"] = t["committee_match"][0][1]
+            r["relevant_committee"] = t["committee_match"][0][0]
+        else:
+            r.setdefault("committee_sector", "")
+            r.setdefault("relevant_committee", "")
 
     # 2) close open positions when the same member sells the ticker
     for t in sells:
