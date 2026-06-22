@@ -589,7 +589,7 @@ def build_report(start: dt.date, end: dt.date, ptrs: list[dict],
         ordered = sorted(trades, key=lambda t: (not t["is_priority"], t["filer"], t["ticker"] or "zzz"))
         for t in ordered:
             name = f"**{t['filer']}**" if t["is_priority"] else t["filer"]
-            flags = ("⭐" if t["is_priority"] else "") + ("⚖️" if t.get("committee_match") else "")
+            flags = ("⭐" if t["is_priority"] else "") + ("🚩" if t.get("committee_match") else "")
             company = short_company(t["asset"], t["ticker"])
             w(f"| {flags or '-'} | {t['ticker'] or '-'} | {company} | {t['txn']} | {name} "
               f"| {t['amount']} | {t['trade_date']} | {t['notification_date']} | {_verify(t)} |")
@@ -763,15 +763,15 @@ def esc(s: str) -> str:
 def trade_line(t: dict) -> str:
     """One trade, markers FIRST so priority/committee signals are unmissable:
 
-    ⭐⚖️ NVDA (NVIDIA) - 🔴 Sell - Nancy Pelosi
-        $1,001-$15,000 · traded 06/16 · ⚖️ tech committee · verify
+    ⭐🚩 NVDA (NVIDIA) - 🔴 Sell - Nancy Pelosi
+        $1,001-$15,000 · traded 06/16 · 🚩 tech committee · verify
     """
     # leading markers - most important signals, before the ticker
     markers = ""
     if t["is_priority"]:
         markers += "⭐"
     if t.get("committee_match"):
-        markers += "⚖️"
+        markers += "🚩"
     markers = (markers + " ") if markers else ""
 
     ticker = esc(t["ticker"] or "—")
@@ -784,7 +784,7 @@ def trade_line(t: dict) -> str:
     amt = esc(t["amount"])
     note = ""
     if t.get("committee_match"):
-        note = f"⚖️ <i>{esc(t['committee_match'][0][1])} committee</i> · "
+        note = f"🚩 <i>{esc(t['committee_match'][0][1])} committee</i> · "
     return (f"{markers}<b>{ticker}</b> ({company}) - {side} - {name} ({chamber})\n"
             f"   {amt} · traded {esc(t['trade_date'])} · {note}"
             f"<a href=\"{t['pdf_url']}\">verify</a>")
@@ -812,7 +812,7 @@ def make_telegram_messages(start: dt.date, end: dt.date, ptrs: list[dict],
         header.append("⭐ No priority-trader trades this week.")
     if not senate_enabled:
         header.append("Note: Senate scraping disabled this run.")
-    header.append("<i>Legend: ⭐ = priority trader · ⚖️ = trades their committee's sector</i>")
+    header.append("<i>Legend: ⭐ = priority trader · 🚩 = trades their committee's sector</i>")
 
     # sort: priority first, then by filer, then ticker
     ordered = sorted(trades, key=lambda t: (not t["is_priority"], t["filer"], t["ticker"] or "zzz"))
