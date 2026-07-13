@@ -7,9 +7,9 @@ on:
     - cron: "4 5 * * 1"
   workflow_dispatch: {}   # lets you trigger it manually from the Actions tab
 
-# allow the workflow to push the weekly heartbeat commit
 permissions:
-  contents: write
+  contents: write   # for the last_run.txt heartbeat commit
+  actions: read     # to find/download the previous run's portfolio-state artifact
 
 jobs:
   report:
@@ -26,6 +26,24 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
+      # portfolio.csv holds the tracker "results" and is deliberately NOT
+      # committed to this (public) repo. It lives only as a private artifact
+      # carried between runs. Restore the latest one here; on the first run
+      # (or if none exists yet) the tracker simply starts fresh.
+      - name: Restore portfolio.csv state
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          run_id=$(gh run list --workflow "weekly-report.yml" --status success \
+                     --limit 1 --json databaseId --jq '.[0].databaseId' 2>/dev/null || true)
+          if [ -n "$run_id" ]; then
+            gh run download "$run_id" -n portfolio-state -D . 2>/dev/null \
+              && echo "Restored portfolio.csv from run $run_id" \
+              || echo "No portfolio-state artifact on run $run_id; starting fresh"
+          else
+            echo "No previous successful run; starting fresh"
+          fi
+
       - name: Run weekly report
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
@@ -39,14 +57,24 @@ jobs:
           path: reports/*.md
           if-no-files-found: warn
 
-      # Commit the updated portfolio.csv + a heartbeat. The weekly commit also
-      # keeps the repo "active" so GitHub never auto-pauses the schedule
-      # (it disables crons after 60 idle days).
-      - name: Persist portfolio + keep schedule alive
+      # Persist the updated tracker state privately for the next run.
+      # Artifacts are only downloadable by people with repo access, so the
+      # results stay private even though the code is public.
+      - name: Save portfolio.csv state
+        uses: actions/upload-artifact@v7
+        with:
+          name: portfolio-state
+          path: portfolio.csv
+          if-no-files-found: warn
+          retention-days: 90
+
+      # Heartbeat commit (timestamp only) so GitHub never auto-pauses the
+      # weekly schedule after 60 idle days. Does NOT commit portfolio.csv.
+      - name: Keep schedule alive (heartbeat)
         run: |
           date -u +"Last automated run: %Y-%m-%dT%H:%M:%SZ" > last_run.txt
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add last_run.txt portfolio.csv
-          git commit -m "chore: weekly portfolio update + heartbeat [skip ci]" || echo "nothing to commit"
+          git add last_run.txt
+          git commit -m "chore: weekly heartbeat [skip ci]" || echo "nothing to commit"
           git push

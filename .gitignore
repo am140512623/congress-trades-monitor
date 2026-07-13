@@ -4,6 +4,11 @@ telegram_config.json
 # generated reports (optional - remove if you want them in the repo)
 reports/
 
+# performance-tracker results: kept OUT of this public repo.
+# Persisted privately between GitHub Actions runs via the "portfolio-state"
+# artifact instead of being committed (see .github/workflows/weekly-report.yml).
+portfolio.csv
+
 # downloaded PTR PDFs (cache)
 _pdfs/
 # yfinance timezone cache
