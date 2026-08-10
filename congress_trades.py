@@ -86,6 +86,10 @@ HOUSE_PTR_PDF = "https://disclosures-clerk.house.gov/public_disc/ptr-pdfs/{year}
 # the Telegram feed instead of one line each; the markdown report still lists them
 # in full (Section 4) because the STOCK Act angle still matters.
 STALE_DISCLOSURE_DAYS = 180
+# One filer can disclose hundreds of trades in a single on-time filing, which the
+# staleness rule above does nothing about. Past this many per filer the feed keeps
+# the most significant and counts the rest; the report still lists them all.
+FEED_MAX_PER_FILER = 12
 # STOCK Act reporting deadline; anything past this is "late" but may still be useful.
 STOCK_ACT_DEADLINE_DAYS = 45
 
@@ -855,6 +859,25 @@ def make_telegram_messages(start: dt.date, end: dt.date, ptrs: list[dict],
     stale = [t for t in trades if is_stale(t)]
     fresh = [t for t in trades if not is_stale(t)]
 
+    # Cap how much any single filer can occupy. Ranked so that whatever survives
+    # the cap is the part worth reading: flagged trades first, then by size.
+    def feed_rank(t: dict) -> tuple:
+        # size before the committee flag: a $25M trade outranks a $5k one that
+        # happens to touch a committee's sector, and Section 2 of the report
+        # carries every committee match regardless of what the feed shows.
+        return (not t["is_priority"], -(t["amount_high"] or 0),
+                not t.get("committee_match"), t["ticker"] or "zzz")
+
+    grouped: dict[str, list[dict]] = {}
+    for t in fresh:
+        grouped.setdefault(t["filer"], []).append(t)
+    fresh, overflow = [], {}
+    for filer, ts in grouped.items():
+        ts = sorted(ts, key=feed_rank)
+        fresh += ts[:FEED_MAX_PER_FILER]
+        if len(ts) > FEED_MAX_PER_FILER:
+            overflow[filer] = ts[FEED_MAX_PER_FILER:]
+
     priority_trades = [t for t in trades if t["is_priority"]]
     high_value = [t for t in trades if t["amount_high"] >= 250_000]
     house_n = sum(1 for t in trades if t["chamber"] == "House")
@@ -875,6 +898,10 @@ def make_telegram_messages(start: dt.date, end: dt.date, ptrs: list[dict],
     if stale:
         header.append(f"🗄 {len(stale)} trade(s) disclosed >{STALE_DISCLOSURE_DAYS} days after "
                       "execution - summarised at the end, full detail in the report.")
+    if overflow:
+        n_over = sum(len(v) for v in overflow.values())
+        header.append(f"➕ {n_over} further trade(s) beyond the first {FEED_MAX_PER_FILER} "
+                      "per filer - summarised at the end.")
     if not senate_enabled:
         header.append("Note: Senate scraping disabled this run.")
     header.append("<i>Legend: ⭐ = priority trader · 🚩 = trades their committee's sector "
@@ -905,6 +932,14 @@ def make_telegram_messages(start: dt.date, end: dt.date, ptrs: list[dict],
                 tags.append(f"🚩 {n_match} committee")
             tag = (", " + ", ".join(tags)) if tags else ""
             lines.append(f"   {esc(filer)}: {len(ts)} trade(s), {span}{tag}")
+        blocks.append("\n".join(lines))
+
+    if overflow:
+        lines = [f"➕ <b>Not shown</b> (beyond the first {FEED_MAX_PER_FILER} per filer, "
+                 "largest first - all of them are in the report)"]
+        for filer, ts in sorted(overflow.items(), key=lambda kv: -len(kv[1])):
+            biggest = max((t["amount_high"] or 0) for t in ts)
+            lines.append(f"   {esc(filer)}: {len(ts)} more, largest ${biggest:,}")
         blocks.append("\n".join(lines))
 
     if any(t["chamber"] == "Senate" for t in fresh):
