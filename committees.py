@@ -83,6 +83,42 @@ TICKER_SECTORS: dict[str, str] = {
 }
 
 
+# Filings carry legal names; rosters and watchlists carry the names people use.
+# A prefix test cannot bridge these, so the pairs are declared.
+NICKNAMES: dict[str, list[str]] = {
+    "tommy": ["thomas"],
+    "dan": ["daniel"],
+    "debbie": ["deborah"],
+    "josh": ["joshua"],
+    "ro": ["rohit"],
+    "bill": ["william"],
+    "bob": ["robert"],
+    "mike": ["michael"],
+    "chris": ["christopher"],
+    "jim": ["james"],
+    "dave": ["david"],
+    "rick": ["richard"],
+    "tom": ["thomas"],
+    "ted": ["edward", "theodore"],
+    "sue": ["susan"],
+    "kathy": ["katherine", "kathleen"],
+}
+
+
+def first_names_match(a: str, b: str) -> bool:
+    """Compare filing first names loosely: middle initials are dropped, either
+    name may be a prefix of the other (Ro/Rohit), and known nicknames are
+    bridged in both directions (Tommy/Thomas)."""
+    a = (a or "").strip().lower()
+    b = (b or "").strip().lower()
+    if not a or not b:
+        return True  # nothing to contradict
+    a, b = a.split()[0], b.split()[0]   # 'thomas h' -> 'thomas'
+    if a.startswith(b[:3]) or b.startswith(a[:3]):
+        return True
+    return b in NICKNAMES.get(a, []) or a in NICKNAMES.get(b, [])
+
+
 def _get(name: str):
     req = urllib.request.Request(_BASE + name, headers={"User-Agent": _UA})
     with urllib.request.urlopen(req, timeout=60) as r:
@@ -130,7 +166,7 @@ class CommitteeIndex:
         # 1) exact-ish: chamber + state + first-name prefix
         for cf, cstate, cch, bio in cands:
             if cch == chamber and (not st or cstate == st):
-                if not fl or fl.startswith(cf[:3]) or cf.startswith(fl[:3]):
+                if first_names_match(fl, cf):
                     return bio
         # 2) fallback: chamber + state only
         for cf, cstate, cch, bio in cands:
@@ -140,6 +176,19 @@ class CommitteeIndex:
         if len(cands) == 1:
             return cands[0][3]
         return None
+
+    def is_member(self, first: str, last: str, chamber: str) -> bool:
+        """True if this filer is a sitting member of the given chamber.
+
+        Deliberately stricter than `bioguide_for`, which falls back to a unique
+        last name regardless of chamber - that fallback is fine for tagging a
+        known member's committees, but as a membership test it would confirm a
+        Senate filer against a House member who happens to share a surname.
+        """
+        for cf, _state, cch, _bio in self._by_last.get((last or "").strip().lower(), []):
+            if cch == chamber and first_names_match(first, cf):
+                return True
+        return False
 
     def committees_for(self, first: str, last: str, state: str, chamber: str) -> list[str]:
         bio = self.bioguide_for(first, last, state, chamber)

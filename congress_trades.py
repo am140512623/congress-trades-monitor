@@ -50,10 +50,17 @@ except ImportError:
     HAS_CURL = False
 
 try:
-    from committees import CommitteeIndex  # committee tagging + sector-match flag
+    from committees import CommitteeIndex, first_names_match  # tagging + name matching
     HAS_COMMITTEES = True
 except ImportError:
     HAS_COMMITTEES = False
+
+    def first_names_match(a: str, b: str) -> bool:  # noqa: D103 - fallback, no nicknames
+        a, b = (a or "").strip().lower(), (b or "").strip().lower()
+        if not a or not b:
+            return True
+        a, b = a.split()[0], b.split()[0]
+        return a.startswith(b[:3]) or b.startswith(a[:3])
 
 try:
     import tracker  # performance tracking of buy positions -> portfolio.csv
@@ -74,6 +81,18 @@ CONFIG_FILE = PROJECT_DIR / "telegram_config.json"
 HOUSE_FD_ZIP = "https://disclosures-clerk.house.gov/public_disc/financial-pdfs/{year}FD.zip"
 HOUSE_PTR_PDF = "https://disclosures-clerk.house.gov/public_disc/ptr-pdfs/{year}/{doc}.pdf"
 
+# A trade disclosed this many days after execution carries no actionable signal -
+# the price has long since moved. Those trades are summarised as a single count in
+# the Telegram feed instead of one line each; the markdown report still lists them
+# in full (Section 4) because the STOCK Act angle still matters.
+STALE_DISCLOSURE_DAYS = 180
+# One filer can disclose hundreds of trades in a single on-time filing, which the
+# staleness rule above does nothing about. Past this many per filer the feed keeps
+# the most significant and counts the rest; the report still lists them all.
+FEED_MAX_PER_FILER = 12
+# STOCK Act reporting deadline; anything past this is "late" but may still be useful.
+STOCK_ACT_DEADLINE_DAYS = 45
+
 # (first name, last name) - last name may be compound (e.g. "Wasserman Schultz").
 PRIORITY_TRADERS = [
     ("Nancy", "Pelosi"), ("Dan", "Crenshaw"), ("Josh", "Gottheimer"),
@@ -83,19 +102,18 @@ PRIORITY_TRADERS = [
 ]
 PRIORITY_DISPLAY = [f"{f} {l}" for f, l in PRIORITY_TRADERS]
 
-
 def is_priority(first: str, last: str) -> bool:
     """Match on last name + a loose first-name check, to avoid both
     false negatives (compound surnames) and false positives (common surnames
-    like 'Green' shared by non-priority members)."""
-    fl = (first or "").strip().lower()
+    like 'Green' shared by non-priority members).
+
+    Senate eFD files Tuberville under "Thomas H" while this list says "Tommy";
+    every one of his trades was silently unflagged until first_names_match()
+    started bridging that.
+    """
     ll = (last or "").strip().lower()
     for pf, pl in PRIORITY_TRADERS:
-        if ll != pl.lower():
-            continue
-        pf = pf.lower()
-        # first names match if either is a prefix of the other (Ro/Rohit, Dave/David)
-        if not fl or fl.startswith(pf[:3]) or pf.startswith(fl[:3]):
+        if ll == pl.lower() and first_names_match(first, pf):
             return True
     return False
 
@@ -319,6 +337,9 @@ def enrich_with_trades(ptrs: list[dict], errors: list[str]) -> list[dict]:
                 t["state_dst"] = p["state_dst"]
                 t["is_priority"] = p["is_priority"]
                 t["pdf_url"] = p["pdf_url"]
+                # the House index has no amendment flag (FilingType is 'P' for
+                # every PTR, original or corrected), so this stays False here.
+                t["is_amendment"] = False
                 t["pdf_notification_date"] = t["notification_date"]  # keep for reference
                 t["notification_date"] = disclosure                  # in-window filing date
             p["trades"] = trades
@@ -334,19 +355,23 @@ def delay_days(t: dict) -> int | None:
     return (nd - td).days if td and nd else None
 
 
-def tag_committees(trades: list[dict], errors: list[str]) -> None:
-    """Attach committee memberships + sector-match info to each trade (in place)."""
+def tag_committees(trades: list[dict], errors: list[str]):
+    """Attach committee memberships + sector-match info to each trade (in place).
+
+    Returns the loaded CommitteeIndex (or None), so the caller can reuse its
+    legislator roster without fetching it twice.
+    """
     for t in trades:
         t.setdefault("committees", [])
         t.setdefault("committee_match", [])
     if not HAS_COMMITTEES:
         errors.append("committees.py unavailable - committee tagging skipped.")
-        return
+        return None
     try:
         idx = with_retries(CommitteeIndex, what="committee data", attempts=2)
     except Exception as e:  # noqa: BLE001
         errors.append(f"Committee data fetch failed - tagging skipped: {e}")
-        return
+        return None
     # cache per (filer, chamber) to avoid repeat lookups
     cache: dict[tuple, list[str]] = {}
     for t in trades:
@@ -358,6 +383,7 @@ def tag_committees(trades: list[dict], errors: list[str]) -> None:
             cache[key] = idx.committees_for(first, last, state, t["chamber"])
         t["committees"] = cache[key]
         t["committee_match"] = idx.committee_sector_matches(t["committees"], t["ticker"])
+    return idx
 
 
 # --------------------------------------------------------------------------- #
@@ -401,7 +427,10 @@ def _senate_listing(s, token, start: dt.date, end: dt.date) -> list[dict]:
     payload = {
         "draw": "1", "start": "0", "length": "100",
         "report_types": "[11]",          # 11 = Periodic Transaction Report
-        "filer_types": "[]",
+        # 1 = Senator. An empty list means *every* filer type, which also returns
+        # candidates, former senators and reporting individuals (senior staff) -
+        # none of whom belong in a report about sitting members' trades.
+        "filer_types": "[1]",
         "submitted_start_date": f"{start:%m/%d/%Y} 00:00:00",
         "submitted_end_date": f"{end:%m/%d/%Y} 23:59:59",
         "candidate_state": "", "senator_state": "", "office_id": "",
@@ -415,9 +444,14 @@ def _senate_listing(s, token, start: dt.date, end: dt.date) -> list[dict]:
     for row in r.json().get("data", []):
         first, last, office, link_html, date = (list(row) + [""] * 5)[:5]
         href = re.search(r'href="([^"]+)"', link_html)
+        # the anchor text carries the report title, which is how eFD marks an
+        # amendment. Without it a re-filing of old trades is indistinguishable
+        # from an original filed years late.
+        title = re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", link_html)).strip()
         out.append({"first": first.strip(), "last": last.strip(),
                     "office": office, "href": href.group(1) if href else None,
-                    "date": date.strip()})
+                    "date": date.strip(), "title": title,
+                    "is_amendment": "amend" in title.lower()})
     return out
 
 
@@ -474,6 +508,10 @@ def fetch_senate_trades(start: dt.date, end: dt.date, errors: list[str]) -> list
 
     all_trades = []
     for f in listing:
+        # eFD name fields carry stray punctuation ("Moran," / "Peters."), which
+        # breaks roster lookups and splits one filer into two in the portfolio.
+        f["first"] = f["first"].strip().strip(",.").strip()
+        f["last"] = f["last"].strip().strip(",.").strip()
         full = f"{f['first']} {f['last']}".strip()
         if not f["href"] or "/ptr/" not in f["href"]:
             errors.append(f"Senate paper/non-electronic filing skipped (not parseable): {full}")
@@ -492,6 +530,7 @@ def fetch_senate_trades(start: dt.date, end: dt.date, errors: list[str]) -> list
             t["state_dst"] = f["office"].split("(")[0].strip()[:14]
             t["is_priority"] = is_priority(f["first"], f["last"])
             t["notification_date"] = f["date"]  # Senate reports filing date, not per-row
+            t["is_amendment"] = f["is_amendment"]
             t["pdf_url"] = url
             all_trades.append(t)
     return all_trades
@@ -636,11 +675,14 @@ def build_report(start: dt.date, end: dt.date, ptrs: list[dict],
     if not delayed:
         w("*No trades exceeded the 45-day STOCK Act disclosure window this cycle.*\n")
     else:
-        w("| Filer | Ticker | Trade Date | Disclosure Date | Delay (days) | Verify |")
-        w("|-------|--------|------------|-----------------|--------------|--------|")
+        w("*An amended filing restates an earlier disclosure, so its delay measures "
+          "time since the trade, not necessarily time spent unreported.*\n")
+        w("| Filer | Ticker | Trade Date | Disclosure Date | Delay (days) | Filing | Verify |")
+        w("|-------|--------|------------|-----------------|--------------|--------|--------|")
         for t, d in sorted(delayed, key=lambda x: -x[1]):
+            kind = "Amendment" if t.get("is_amendment") else "Original"
             w(f"| {t['filer']} | {t['ticker'] or t['asset']} | {t['trade_date']} "
-              f"| {t['notification_date']} | {d} | {_verify(t)} |")
+              f"| {t['notification_date']} | {d} | {kind} | {_verify(t)} |")
         w("")
     w("---\n")
 
@@ -657,6 +699,9 @@ def build_report(start: dt.date, end: dt.date, ptrs: list[dict],
     else:
         gaps.insert(0, "Senate paper (non-electronic) filings are scanned images and "
                        "cannot be parsed; only electronic Senate PTRs are included.")
+    gaps.append("House filings cannot be identified as amendments: the House index "
+                "reports FilingType 'P' for every PTR, original or corrected. House "
+                "rows in Section 4 therefore all show as 'Original'.")
     if not HAS_PDF:
         gaps.insert(0, "pdfplumber is not installed - per-trade detail was NOT parsed "
                        "this run (filing-level only). Install requirements.txt.")
@@ -772,6 +817,9 @@ def trade_line(t: dict) -> str:
         markers += "⭐"
     if t.get("committee_match"):
         markers += "🚩"
+    d = delay_days(t)
+    if d is not None and d > STOCK_ACT_DEADLINE_DAYS:
+        markers += "⏰"
     markers = (markers + " ") if markers else ""
 
     ticker = esc(t["ticker"] or "—")
@@ -785,14 +833,51 @@ def trade_line(t: dict) -> str:
     note = ""
     if t.get("committee_match"):
         note = f"🚩 <i>{esc(t['committee_match'][0][1])} committee</i> · "
+    # show when it was filed, not just when it was traded - a bare 2024 trade date
+    # under a "this week" header reads like stale data rather than a late filing.
+    filed = f"filed {esc(t['notification_date'])}"
+    if d is not None and d > STOCK_ACT_DEADLINE_DAYS:
+        kind = "amended" if t.get("is_amendment") else "late"
+        filed += f" (<b>{d}d {kind}</b>)"
     return (f"{markers}<b>{ticker}</b> ({company}) - {side} - {name} ({chamber})\n"
-            f"   {amt} · traded {esc(t['trade_date'])} · {note}"
+            f"   {amt} · traded {esc(t['trade_date'])} · {filed} · {note}"
             f"<a href=\"{t['pdf_url']}\">verify</a>")
 
 
 def make_telegram_messages(start: dt.date, end: dt.date, ptrs: list[dict],
                            trades: list[dict], senate_enabled: bool = False) -> list[str]:
     """Build Telegram-friendly HTML messages (line based), chunked under 4096 chars."""
+    # Split off trades disclosed so late they carry no signal. They are counted in
+    # the header and summarised at the end rather than given a line each - a single
+    # bulk catch-up filing can otherwise be hundreds of dead lines. Age alone
+    # decides this: a two-year-old trade is equally unactionable whoever filed it,
+    # so priority and committee hits are surfaced in the summary, not exempted.
+    def is_stale(t: dict) -> bool:
+        d = delay_days(t)
+        return d is not None and d > STALE_DISCLOSURE_DAYS
+
+    stale = [t for t in trades if is_stale(t)]
+    fresh = [t for t in trades if not is_stale(t)]
+
+    # Cap how much any single filer can occupy. Ranked so that whatever survives
+    # the cap is the part worth reading: flagged trades first, then by size.
+    def feed_rank(t: dict) -> tuple:
+        # size before the committee flag: a $25M trade outranks a $5k one that
+        # happens to touch a committee's sector, and Section 2 of the report
+        # carries every committee match regardless of what the feed shows.
+        return (not t["is_priority"], -(t["amount_high"] or 0),
+                not t.get("committee_match"), t["ticker"] or "zzz")
+
+    grouped: dict[str, list[dict]] = {}
+    for t in fresh:
+        grouped.setdefault(t["filer"], []).append(t)
+    fresh, overflow = [], {}
+    for filer, ts in grouped.items():
+        ts = sorted(ts, key=feed_rank)
+        fresh += ts[:FEED_MAX_PER_FILER]
+        if len(ts) > FEED_MAX_PER_FILER:
+            overflow[filer] = ts[FEED_MAX_PER_FILER:]
+
     priority_trades = [t for t in trades if t["is_priority"]]
     high_value = [t for t in trades if t["amount_high"] >= 250_000]
     house_n = sum(1 for t in trades if t["chamber"] == "House")
@@ -810,14 +895,56 @@ def make_telegram_messages(start: dt.date, end: dt.date, ptrs: list[dict],
         header.append(f"⭐ Priority-trader trades: {len(priority_trades)} ({esc(names)})")
     else:
         header.append("⭐ No priority-trader trades this week.")
+    if stale:
+        header.append(f"🗄 {len(stale)} trade(s) disclosed >{STALE_DISCLOSURE_DAYS} days after "
+                      "execution - summarised at the end, full detail in the report.")
+    if overflow:
+        n_over = sum(len(v) for v in overflow.values())
+        header.append(f"➕ {n_over} further trade(s) beyond the first {FEED_MAX_PER_FILER} "
+                      "per filer - summarised at the end.")
     if not senate_enabled:
         header.append("Note: Senate scraping disabled this run.")
-    header.append("<i>Legend: ⭐ = priority trader · 🚩 = trades their committee's sector</i>")
+    header.append("<i>Legend: ⭐ = priority trader · 🚩 = trades their committee's sector "
+                  "· ⏰ = filed past the 45-day deadline</i>")
 
     # sort: priority first, then by filer, then ticker
-    ordered = sorted(trades, key=lambda t: (not t["is_priority"], t["filer"], t["ticker"] or "zzz"))
+    ordered = sorted(fresh, key=lambda t: (not t["is_priority"], t["filer"], t["ticker"] or "zzz"))
     blocks = ["\n".join(header)]
     blocks += [trade_line(t) for t in ordered]
+
+    if stale:
+        by_filer: dict[str, list[dict]] = {}
+        for t in stale:
+            by_filer.setdefault(t["filer"], []).append(t)
+        lines = [f"🗄 <b>Stale disclosures</b> (traded >{STALE_DISCLOSURE_DAYS} days "
+                 "before filing - no actionable edge, listed for the record)"]
+        for filer, ts in sorted(by_filer.items(), key=lambda kv: -len(kv[1])):
+            delays = [d for d in (delay_days(t) for t in ts) if d is not None]
+            span = f"{min(delays)}-{max(delays)}d late" if delays else "delay unknown"
+            amended = sum(1 for t in ts if t.get("is_amendment"))
+            tags = []
+            if amended:
+                tags.append(f"{amended} amended")
+            if any(t["is_priority"] for t in ts):
+                tags.append("⭐ priority")
+            n_match = sum(1 for t in ts if t.get("committee_match"))
+            if n_match:
+                tags.append(f"🚩 {n_match} committee")
+            tag = (", " + ", ".join(tags)) if tags else ""
+            lines.append(f"   {esc(filer)}: {len(ts)} trade(s), {span}{tag}")
+        blocks.append("\n".join(lines))
+
+    if overflow:
+        lines = [f"➕ <b>Not shown</b> (beyond the first {FEED_MAX_PER_FILER} per filer, "
+                 "largest first - all of them are in the report)"]
+        for filer, ts in sorted(overflow.items(), key=lambda kv: -len(kv[1])):
+            biggest = max((t["amount_high"] or 0) for t in ts)
+            lines.append(f"   {esc(filer)}: {len(ts)} more, largest ${biggest:,}")
+        blocks.append("\n".join(lines))
+
+    if any(t["chamber"] == "Senate" for t in fresh):
+        blocks.append("<i>Senate verify links need efdsearch.senate.gov terms accepted "
+                      "once per browser, otherwise they will not open.</i>")
 
     # chunk blocks into messages under the 4096 limit
     messages, cur = [], ""
@@ -898,7 +1025,7 @@ def run() -> int:
     else:
         print("Senate scraping skipped (--no-senate).")
 
-    tag_committees(trades, errors)
+    idx = tag_committees(trades, errors)
     n_match = sum(1 for t in trades if t.get("committee_match"))
     print(f"Committee-sector matches: {n_match}")
 
@@ -908,10 +1035,17 @@ def run() -> int:
 
     if not args.no_track:
         if HAS_TRACKER:
-            summary = tracker.update(PORTFOLIO_FILE, trades, errors)
+            # without the roster the tracker cannot tell a non-member from a
+            # name-match failure, so it leaves existing rows alone.
+            summary = tracker.update(PORTFOLIO_FILE, trades, errors,
+                                     is_member=idx.is_member if idx else None,
+                                     stale_days=STALE_DISCLOSURE_DAYS)
             print(f"Tracker: {summary['opened']} opened, {summary['closed']} closed, "
-                  f"{summary['updated']} refreshed, {summary['skipped']} skipped "
-                  f"(portfolio total: {summary['total']})")
+                  f"{summary['updated']} refreshed, {summary['skipped']} skipped, "
+                  f"{summary['stale']} stale (portfolio total: {summary['total']})")
+            if summary["dropped_stale"] or summary["reindexed"]:
+                print(f"  migration: {summary['dropped_stale']} stale row(s) dropped, "
+                      f"{summary['reindexed']} re-indexed")
         else:
             errors.append("tracker.py / yfinance unavailable - tracking skipped.")
     else:
@@ -924,9 +1058,18 @@ def run() -> int:
     out_file.write_text(report, encoding="utf-8")
     print(f"Report saved: {out_file}")
 
+    messages = make_telegram_messages(start, end, ptrs, trades, senate_enabled)
+
     if args.no_send:
         print("\n" + "=" * 60 + "\n")
         print(report)
+        # preview exactly what would have gone to Telegram, so --no-send can be
+        # used to check the feed and not just the markdown report.
+        print("\n" + "=" * 60)
+        print(f"Telegram preview: {len(messages)} message(s) would be sent\n")
+        for i, m in enumerate(messages, 1):
+            print(f"--- message {i}/{len(messages)} ---")
+            print(m + "\n")
         return 0
 
     token, chat_id = load_telegram_creds()
@@ -935,7 +1078,6 @@ def run() -> int:
               "Report saved but not sent.", file=sys.stderr)
         return 1
 
-    messages = make_telegram_messages(start, end, ptrs, trades, senate_enabled)
     deliver(token, chat_id, messages)
     return 0
 
