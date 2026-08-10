@@ -423,9 +423,9 @@ def _senate_listing(s, token, start: dt.date, end: dt.date) -> list[dict]:
     payload = {
         "draw": "1", "start": "0", "length": "100",
         "report_types": "[11]",          # 11 = Periodic Transaction Report
-        # 1 = Senator. An empty list means *every* filer type, which pulls in
-        # candidates and reporting individuals (senior staff) who are not members
-        # of Congress - one such filer once accounted for 69% of the tracker.
+        # 1 = Senator. An empty list means *every* filer type, which also returns
+        # candidates, former senators and reporting individuals (senior staff) -
+        # none of whom belong in a report about sitting members' trades.
         "filer_types": "[1]",
         "submitted_start_date": f"{start:%m/%d/%Y} 00:00:00",
         "submitted_end_date": f"{end:%m/%d/%Y} 23:59:59",
