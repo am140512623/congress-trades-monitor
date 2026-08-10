@@ -50,10 +50,17 @@ except ImportError:
     HAS_CURL = False
 
 try:
-    from committees import CommitteeIndex  # committee tagging + sector-match flag
+    from committees import CommitteeIndex, first_names_match  # tagging + name matching
     HAS_COMMITTEES = True
 except ImportError:
     HAS_COMMITTEES = False
+
+    def first_names_match(a: str, b: str) -> bool:  # noqa: D103 - fallback, no nicknames
+        a, b = (a or "").strip().lower(), (b or "").strip().lower()
+        if not a or not b:
+            return True
+        a, b = a.split()[0], b.split()[0]
+        return a.startswith(b[:3]) or b.startswith(a[:3])
 
 try:
     import tracker  # performance tracking of buy positions -> portfolio.csv
@@ -91,35 +98,18 @@ PRIORITY_TRADERS = [
 ]
 PRIORITY_DISPLAY = [f"{f} {l}" for f, l in PRIORITY_TRADERS]
 
-# Filings use legal names; the list above uses the names people know. A prefix
-# check cannot bridge these, so they are declared. Senate eFD files Tuberville as
-# "Thomas H", which silently excluded every one of his trades before this existed.
-NICKNAMES = {
-    "tommy": ["thomas"],
-    "dan": ["daniel"],
-    "debbie": ["deborah"],
-    "josh": ["joshua"],
-    "ro": ["rohit"],
-    "kevin": ["kevin"],
-}
-
-
 def is_priority(first: str, last: str) -> bool:
     """Match on last name + a loose first-name check, to avoid both
     false negatives (compound surnames) and false positives (common surnames
-    like 'Green' shared by non-priority members)."""
-    fl = (first or "").strip().lower()
+    like 'Green' shared by non-priority members).
+
+    Senate eFD files Tuberville under "Thomas H" while this list says "Tommy";
+    every one of his trades was silently unflagged until first_names_match()
+    started bridging that.
+    """
     ll = (last or "").strip().lower()
-    # filings often carry a middle initial ("Thomas H") - compare the first token
-    fl_head = fl.split()[0] if fl else ""
     for pf, pl in PRIORITY_TRADERS:
-        if ll != pl.lower():
-            continue
-        pf = pf.lower()
-        # first names match if either is a prefix of the other (Ro/Rohit, Dave/David)
-        if not fl or fl.startswith(pf[:3]) or pf.startswith(fl[:3]):
-            return True
-        if fl_head in NICKNAMES.get(pf, []):
+        if ll == pl.lower() and first_names_match(first, pf):
             return True
     return False
 
@@ -361,19 +351,23 @@ def delay_days(t: dict) -> int | None:
     return (nd - td).days if td and nd else None
 
 
-def tag_committees(trades: list[dict], errors: list[str]) -> None:
-    """Attach committee memberships + sector-match info to each trade (in place)."""
+def tag_committees(trades: list[dict], errors: list[str]):
+    """Attach committee memberships + sector-match info to each trade (in place).
+
+    Returns the loaded CommitteeIndex (or None), so the caller can reuse its
+    legislator roster without fetching it twice.
+    """
     for t in trades:
         t.setdefault("committees", [])
         t.setdefault("committee_match", [])
     if not HAS_COMMITTEES:
         errors.append("committees.py unavailable - committee tagging skipped.")
-        return
+        return None
     try:
         idx = with_retries(CommitteeIndex, what="committee data", attempts=2)
     except Exception as e:  # noqa: BLE001
         errors.append(f"Committee data fetch failed - tagging skipped: {e}")
-        return
+        return None
     # cache per (filer, chamber) to avoid repeat lookups
     cache: dict[tuple, list[str]] = {}
     for t in trades:
@@ -385,6 +379,7 @@ def tag_committees(trades: list[dict], errors: list[str]) -> None:
             cache[key] = idx.committees_for(first, last, state, t["chamber"])
         t["committees"] = cache[key]
         t["committee_match"] = idx.committee_sector_matches(t["committees"], t["ticker"])
+    return idx
 
 
 # --------------------------------------------------------------------------- #
@@ -428,7 +423,10 @@ def _senate_listing(s, token, start: dt.date, end: dt.date) -> list[dict]:
     payload = {
         "draw": "1", "start": "0", "length": "100",
         "report_types": "[11]",          # 11 = Periodic Transaction Report
-        "filer_types": "[]",
+        # 1 = Senator. An empty list means *every* filer type, which pulls in
+        # candidates and reporting individuals (senior staff) who are not members
+        # of Congress - one such filer once accounted for 69% of the tracker.
+        "filer_types": "[1]",
         "submitted_start_date": f"{start:%m/%d/%Y} 00:00:00",
         "submitted_end_date": f"{end:%m/%d/%Y} 23:59:59",
         "candidate_state": "", "senator_state": "", "office_id": "",
@@ -506,6 +504,10 @@ def fetch_senate_trades(start: dt.date, end: dt.date, errors: list[str]) -> list
 
     all_trades = []
     for f in listing:
+        # eFD name fields carry stray punctuation ("Moran," / "Peters."), which
+        # breaks roster lookups and splits one filer into two in the portfolio.
+        f["first"] = f["first"].strip().strip(",.").strip()
+        f["last"] = f["last"].strip().strip(",.").strip()
         full = f"{f['first']} {f['last']}".strip()
         if not f["href"] or "/ptr/" not in f["href"]:
             errors.append(f"Senate paper/non-electronic filing skipped (not parseable): {full}")
@@ -988,7 +990,7 @@ def run() -> int:
     else:
         print("Senate scraping skipped (--no-senate).")
 
-    tag_committees(trades, errors)
+    idx = tag_committees(trades, errors)
     n_match = sum(1 for t in trades if t.get("committee_match"))
     print(f"Committee-sector matches: {n_match}")
 
@@ -998,10 +1000,17 @@ def run() -> int:
 
     if not args.no_track:
         if HAS_TRACKER:
-            summary = tracker.update(PORTFOLIO_FILE, trades, errors)
+            # without the roster the tracker cannot tell a non-member from a
+            # name-match failure, so it leaves existing rows alone.
+            summary = tracker.update(PORTFOLIO_FILE, trades, errors,
+                                     is_member=idx.is_member if idx else None,
+                                     stale_days=STALE_DISCLOSURE_DAYS)
             print(f"Tracker: {summary['opened']} opened, {summary['closed']} closed, "
-                  f"{summary['updated']} refreshed, {summary['skipped']} skipped "
-                  f"(portfolio total: {summary['total']})")
+                  f"{summary['updated']} refreshed, {summary['skipped']} skipped, "
+                  f"{summary['stale']} stale (portfolio total: {summary['total']})")
+            if summary["dropped_stale"] or summary["reindexed"]:
+                print(f"  migration: {summary['dropped_stale']} stale row(s) dropped, "
+                      f"{summary['reindexed']} re-indexed")
         else:
             errors.append("tracker.py / yfinance unavailable - tracking skipped.")
     else:
